@@ -1,0 +1,2762 @@
+Participants:
+    apiserver
+    scheduler
+    kubelet
+    ovn-k control plane
+    ovn-k node
+    
+Basic flow:
+    Apiserver -> ovn-kubernetes master -> nbdb -> northd -> sbdb -> ovn-controller -> openvswitch
+
+
+
+
+1. Pod Object is created
+2. Scheduled
+3. Kubelet notices the pod
+4. Kubelet creates a sandbox over CRI to CRIO
+5. CRIO executes CNI plugin
+6. CNI plugin sends request to ovn-k node
+7. OVN-k node creates veth, waits for annotations *and* flow in vswitchd
+-- ---- --- meanwhile --- --- ---
+8. ovn-k master notices the pod, executes addLogicalPort
+9. addLogicalPort configures pod in northd
+10. ovn-k master sets annotations
+11. northd generates flows
+12. ovn-controller programs openvswitch
+---------- all done
+13. ovn-k node sees that annotations and flows are present, returns response to CNI request
+14. CNI binary exits
+15. CRI-O returns response
+16. Kubelet continues setting up pod
+
+
+ovn-nbctl show
+ovn-sbctl show
+ovs-vsctl show
+ovs-vsctl find interface
+ovs-ofctl dump-ports-desc <OVS_BRIDGE>
+
+sh-4.4# ovn-sbctl --no-leader-only lflow-list
+You can use the “ovn-sbctl lflow-list” command to view the full set of logical flows. The structure will feel somewhat familiar to OpenFlow, but there are some key differences:
+
+
+
+https://blog.russellbryant.net/2016/11/11/ovn-logical-flows-and-ovn-trace/
+
+
+
+sh-4.4# ovn-nbctl --no-leader show | grep -i httpd-67d9dd4546-h2bp8 -A1
+    port test-label_httpd-67d9dd4546-h2bp8
+        addresses: ["0a:58:0a:81:02:09 10.129.2.9"]
+
+sh-4.4# ovn-nbctl --no-leader show | grep -i "port rtos-worker-2.aygarg.example.com" -A3
+    port rtos-worker-2.aygarg.example.com
+        mac: "0a:58:0a:81:02:01"
+        networks: ["10.129.2.1/23"]
+        gateway chassis: [958aa269-1460-40c2-b81e-16525d79729e]
+
+
+$ oc get pod -o wide -A | grep -i httpd
+ayush                                              httpd-67d9dd4546-sztcr                                                   1/1     Running     0              9m55s   10.131.0.28     worker-1.aygarg.example.com   <none>           <none>
+test-label                                         httpd-67d9dd4546-h2bp8                                                   1/1     Running     0              6m36s   10.129.2.9      worker-2.aygarg.example.com   <none>           <none>
+test-no-label                                      httpd-67d9dd4546-f579l                                                   1/1     Running     0              6m48s   10.131.0.29     worker-1.aygarg.example.com   <none>           <none>
+
+
+sh-4.4# ovn-trace --no-leader-only worker-2.aygarg.example.com 'inport=="test-label_httpd-67d9dd4546-h2bp8" && eth.src==0a:58:0a:81:02:09 && eth.dst==0a:58:0a:81:02:01 && tcp && tcp.src==5555 && tcp.dst==8080 && ip4.src==10.129.2.9 && ip4.dst==10.131.0.28 && ip.ttl==64'
+
+sh-4.4# ovn-trace --no-leader-only worker-2.aygarg.example.com 'inport=="test-label_httpd-67d9dd4546-h2bp8" && eth.src==0a:58:0a:81:02:09 && eth.dst==0a:58:0a:81:02:01 && tcp && tcp.src==5555 && tcp.dst==8080 && ip4.src==10.129.2.9 && ip4.dst==172.30.208.236 && ip.ttl==64' --lb-dst 10.131.0.28:8080
+
+I0420 09:36:04.202350   22647 ovs.go:90] Maximum command line arguments set to: 191102
+I0420 09:36:04.202615   22647 ovnkube-trace.go:992] Log level set to: 2
+I0420 09:36:05.351766   22647 ovnkube-trace.go:615] ovn-trace source pod to destination pod Output:
+[3m# tcp,reg14=0x9,vlan_tci=0x0000,dl_src=0a:58:0a:81:02:09,dl_dst=0a:58:0a:81:02:01,nw_src=10.129.2.9,nw_dst=10.131.0.28,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=52888,tp_dst=8080,tcp_flags=0
+
+ingress(dp="worker-2.aygarg.example.com", inport="test-label_httpd-67d9dd4546-h2bp8")
+-------------------------------------------------------------------------------------------------
+ 0. ls_in_check_port_sec (northd.c:8410): 1, priority 50, uuid 5aba4ca0
+    reg0[15] = check_in_port_sec();
+    next;
+ 4. ls_in_pre_acl (northd.c:5868): ip, priority 100, uuid 45bf886a
+    reg0[0] = 1;
+    next;
+ 5. ls_in_pre_lb (northd.c:6038): ip, priority 100, uuid 0f55a2d7
+    reg0[2] = 1;
+    next;
+ 6. ls_in_pre_stateful (northd.c:6061): reg0[2] == 1, priority 110, uuid 22d08286
+    ct_lb_mark;
+
+ct_lb_mark /* default (use --ct to customize) */
+------------------------------------------------
+ 7. ls_in_acl_hint (northd.c:6159): !ct.new && ct.est && !ct.rpl && ct_mark.blocked == 0, priority 4, uuid ee05988c
+    reg0[8] = 1;
+    reg0[10] = 1;
+    next;
+14. ls_in_pre_hairpin (northd.c:7616): ip && ct.trk, priority 100, uuid 700253a5
+    reg0[6] = chk_lb_hairpin();
+    reg0[12] = chk_lb_hairpin_reply();
+    next;
+25. ls_in_l2_lkup (northd.c:9147): eth.dst == 0a:58:0a:81:02:01, priority 50, uuid 025b9058
+    outport = "stor-worker-2.aygarg.example.com";
+    output;
+
+egress(dp="worker-2.aygarg.example.com", inport="test-label_httpd-67d9dd4546-h2bp8", outport="stor-worker-2.aygarg.example.com")
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ 0. ls_out_pre_lb (northd.c:5758): ip && outport == "stor-worker-2.aygarg.example.com", priority 110, uuid e5ba8c50
+    next;
+ 1. ls_out_pre_acl (northd.c:5758): ip && outport == "stor-worker-2.aygarg.example.com", priority 110, uuid b6375457
+    next;
+ 3. ls_out_acl_hint (northd.c:6159): !ct.new && ct.est && !ct.rpl && ct_mark.blocked == 0, priority 4, uuid 79c5913c
+    reg0[8] = 1;
+    reg0[10] = 1;
+    next;
+ 8. ls_out_check_port_sec (northd.c:5724): 1, priority 0, uuid 4bb43fc3
+    reg0[15] = check_out_port_sec();
+    next;
+ 9. ls_out_apply_port_sec (northd.c:5729): 1, priority 0, uuid 19eeb67a
+    output;
+    /* output to "stor-worker-2.aygarg.example.com", type "patch" */
+
+ingress(dp="ovn_cluster_router", inport="rtos-worker-2.aygarg.example.com")
+---------------------------------------------------------------------------------------
+ 0. lr_in_admission (northd.c:11607): eth.dst == 0a:58:0a:81:02:01 && inport == "rtos-worker-2.aygarg.example.com" && is_chassis_resident("cr-rtos-worker-2.aygarg.example.com"), priority 50, uuid 0eac4244
+    xreg0[0..47] = 0a:58:0a:81:02:01;
+    next;
+ 1. lr_in_lookup_neighbor (northd.c:11764): 1, priority 0, uuid a52f6fb4
+    reg9[2] = 1;
+    next;
+ 2. lr_in_learn_neighbor (northd.c:11773): reg9[2] == 1, priority 100, uuid b12e07d7
+    next;
+12. lr_in_ip_routing_pre (northd.c:12001): 1, priority 0, uuid f0f9778b
+    reg7 = 0;
+    next;
+13. lr_in_ip_routing (northd.c:10341): ip4.dst == 10.131.0.0/23, priority 71, uuid 5a6ca1b1
+    ip.ttl--;
+    reg8[0..15] = 0;
+    reg0 = ip4.dst;
+    reg1 = 10.131.0.1;
+    eth.src = 0a:58:0a:83:00:01;
+    outport = "rtos-worker-1.aygarg.example.com";
+    flags.loopback = 1;
+    next;
+14. lr_in_ip_routing_ecmp (northd.c:12079): reg8[0..15] == 0, priority 150, uuid a45c00c0
+    next;
+15. lr_in_policy (northd.c:9478): ip4.src == 10.128.0.0/14 && ip4.dst == 10.128.0.0/14, priority 102, uuid 8a306a40
+    reg8[0..15] = 0;
+    next;
+16. lr_in_policy_ecmp (northd.c:12248): reg8[0..15] == 0, priority 150, uuid 9cb3bb4f
+    next;
+17. lr_in_arp_resolve (northd.c:12455): outport == "rtos-worker-1.aygarg.example.com" && reg0 == 10.131.0.28, priority 100, uuid 10b79ffc
+    eth.dst = 0a:58:0a:83:00:1c;
+    next;
+20. lr_in_gw_redirect (northd.c:12853): outport == "rtos-worker-1.aygarg.example.com", priority 50, uuid 31413f3f
+    outport = "cr-rtos-worker-1.aygarg.example.com";
+    next;
+21. lr_in_arp_request (northd.c:12969): 1, priority 0, uuid d7102543
+    output;
+    /* Replacing type "chassisredirect" outport "cr-rtos-worker-1.aygarg.example.com" with distributed port "rtos-worker-1.aygarg.example.com". */
+
+egress(dp="ovn_cluster_router", inport="rtos-worker-2.aygarg.example.com", outport="rtos-worker-1.aygarg.example.com")
+----------------------------------------------------------------------------------------------------------------------------------------------
+ 0. lr_out_chk_dnat_local (northd.c:14250): 1, priority 0, uuid 281b37c0
+    reg9[4] = 0;
+    next;
+ 6. lr_out_delivery (northd.c:13017): outport == "rtos-worker-1.aygarg.example.com", priority 100, uuid 55c8828b
+    output;
+    /* output to "rtos-worker-1.aygarg.example.com", type "patch" */
+
+ingress(dp="worker-1.aygarg.example.com", inport="stor-worker-1.aygarg.example.com")
+------------------------------------------------------------------------------------------------------------
+ 0. ls_in_check_port_sec (northd.c:8410): 1, priority 50, uuid 5aba4ca0
+    reg0[15] = check_in_port_sec();
+    next;
+ 4. ls_in_pre_acl (northd.c:5755): ip && inport == "stor-worker-1.aygarg.example.com", priority 110, uuid 8e5b1efc
+    next;
+ 5. ls_in_pre_lb (northd.c:5755): ip && inport == "stor-worker-1.aygarg.example.com", priority 110, uuid d4c7bf8e
+    next;
+ 7. ls_in_acl_hint (northd.c:6159): !ct.new && ct.est && !ct.rpl && ct_mark.blocked == 0, priority 4, uuid ee05988c
+    reg0[8] = 1;
+    reg0[10] = 1;
+    next;
+14. ls_in_pre_hairpin (northd.c:7616): ip && ct.trk, priority 100, uuid 700253a5
+    reg0[6] = chk_lb_hairpin();
+    reg0[12] = chk_lb_hairpin_reply();
+    next;
+25. ls_in_l2_lkup (northd.c:9076): eth.dst == 0a:58:0a:83:00:1c, priority 50, uuid d81d42b0
+    outport = "ayush_httpd-67d9dd4546-sztcr";
+    output;
+
+egress(dp="worker-1.aygarg.example.com", inport="stor-worker-1.aygarg.example.com", outport="ayush_httpd-67d9dd4546-sztcr")
+---------------------------------------------------------------------------------------------------------------------------------------------------
+ 0. ls_out_pre_lb (northd.c:6040): ip, priority 100, uuid 02d367b6
+    reg0[2] = 1;
+    next;
+ 1. ls_out_pre_acl (northd.c:5870): ip, priority 100, uuid 1aab00a9
+    reg0[0] = 1;
+    next;
+ 2. ls_out_pre_stateful (northd.c:6064): reg0[2] == 1, priority 110, uuid a7399496
+    ct_lb_mark;
+
+ct_lb_mark /* default (use --ct to customize) */
+------------------------------------------------
+ 3. ls_out_acl_hint (northd.c:6159): !ct.new && ct.est && !ct.rpl && ct_mark.blocked == 0, priority 4, uuid 79c5913c
+    reg0[8] = 1;
+    reg0[10] = 1;
+    next;
+ 4. ls_out_acl (northd.c:6401): reg0[8] == 1 && (ip4.src == {$a11003600352308087752, $a4449682624240568089} && outport == @a14867883077327806347), priority 2001, uuid 1020b15f
+    next;
+ 8. ls_out_check_port_sec (northd.c:5724): 1, priority 0, uuid 4bb43fc3
+    reg0[15] = check_out_port_sec();
+    next;
+ 9. ls_out_apply_port_sec (northd.c:5729): 1, priority 0, uuid 19eeb67a
+    output;
+    /* output to "ayush_httpd-67d9dd4546-sztcr", type "" */
+[0m
+[32m[1movn-trace source pod to destination pod indicates success from httpd-67d9dd4546-h2bp8 to httpd-67d9dd4546-sztcr[0m
+I0420 09:36:05.351903   22647 ovnkube-trace.go:626] [32mSearch string matched:
+output to "ayush_httpd-67d9dd4546-sztcr"[0m
+I0420 09:36:05.584253   22647 ovnkube-trace.go:615] ovn-trace destination pod to source pod Output:
+[3m# tcp,reg14=0x13,vlan_tci=0x0000,dl_src=0a:58:0a:83:00:1c,dl_dst=0a:58:0a:83:00:01,nw_src=10.131.0.28,nw_dst=10.129.2.9,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=52888,tp_dst=8080,tcp_flags=0
+
+ingress(dp="worker-1.aygarg.example.com", inport="ayush_httpd-67d9dd4546-sztcr")
+--------------------------------------------------------------------------------------------
+ 0. ls_in_check_port_sec (northd.c:8410): 1, priority 50, uuid 5aba4ca0
+    reg0[15] = check_in_port_sec();
+    next;
+ 4. ls_in_pre_acl (northd.c:5868): ip, priority 100, uuid 45bf886a
+    reg0[0] = 1;
+    next;
+ 5. ls_in_pre_lb (northd.c:6038): ip, priority 100, uuid 0f55a2d7
+    reg0[2] = 1;
+    next;
+ 6. ls_in_pre_stateful (northd.c:6061): reg0[2] == 1, priority 110, uuid 22d08286
+    ct_lb_mark;
+
+ct_lb_mark /* default (use --ct to customize) */
+------------------------------------------------
+ 7. ls_in_acl_hint (northd.c:6159): !ct.new && ct.est && !ct.rpl && ct_mark.blocked == 0, priority 4, uuid ee05988c
+    reg0[8] = 1;
+    reg0[10] = 1;
+    next;
+14. ls_in_pre_hairpin (northd.c:7616): ip && ct.trk, priority 100, uuid 700253a5
+    reg0[6] = chk_lb_hairpin();
+    reg0[12] = chk_lb_hairpin_reply();
+    next;
+25. ls_in_l2_lkup (northd.c:9147): eth.dst == 0a:58:0a:83:00:01, priority 50, uuid 2e1b5291
+    outport = "stor-worker-1.aygarg.example.com";
+    output;
+
+egress(dp="worker-1.aygarg.example.com", inport="ayush_httpd-67d9dd4546-sztcr", outport="stor-worker-1.aygarg.example.com")
+---------------------------------------------------------------------------------------------------------------------------------------------------
+ 0. ls_out_pre_lb (northd.c:5758): ip && outport == "stor-worker-1.aygarg.example.com", priority 110, uuid 834e6aa3
+    next;
+ 1. ls_out_pre_acl (northd.c:5758): ip && outport == "stor-worker-1.aygarg.example.com", priority 110, uuid 9cc1b937
+    next;
+ 3. ls_out_acl_hint (northd.c:6159): !ct.new && ct.est && !ct.rpl && ct_mark.blocked == 0, priority 4, uuid 79c5913c
+    reg0[8] = 1;
+    reg0[10] = 1;
+    next;
+ 8. ls_out_check_port_sec (northd.c:5724): 1, priority 0, uuid 4bb43fc3
+    reg0[15] = check_out_port_sec();
+    next;
+ 9. ls_out_apply_port_sec (northd.c:5729): 1, priority 0, uuid 19eeb67a
+    output;
+    /* output to "stor-worker-1.aygarg.example.com", type "patch" */
+
+ingress(dp="ovn_cluster_router", inport="rtos-worker-1.aygarg.example.com")
+---------------------------------------------------------------------------------------
+ 0. lr_in_admission (northd.c:11607): eth.dst == 0a:58:0a:83:00:01 && inport == "rtos-worker-1.aygarg.example.com" && is_chassis_resident("cr-rtos-worker-1.aygarg.example.com"), priority 50, uuid 0e57bbf7
+    xreg0[0..47] = 0a:58:0a:83:00:01;
+    next;
+ 1. lr_in_lookup_neighbor (northd.c:11764): 1, priority 0, uuid a52f6fb4
+    reg9[2] = 1;
+    next;
+ 2. lr_in_learn_neighbor (northd.c:11773): reg9[2] == 1, priority 100, uuid b12e07d7
+    next;
+12. lr_in_ip_routing_pre (northd.c:12001): 1, priority 0, uuid f0f9778b
+    reg7 = 0;
+    next;
+13. lr_in_ip_routing (northd.c:10341): ip4.dst == 10.129.2.0/23, priority 71, uuid 15cb4afd
+    ip.ttl--;
+    reg8[0..15] = 0;
+    reg0 = ip4.dst;
+    reg1 = 10.129.2.1;
+    eth.src = 0a:58:0a:81:02:01;
+    outport = "rtos-worker-2.aygarg.example.com";
+    flags.loopback = 1;
+    next;
+14. lr_in_ip_routing_ecmp (northd.c:12079): reg8[0..15] == 0, priority 150, uuid a45c00c0
+    next;
+15. lr_in_policy (northd.c:9478): ip4.src == 10.128.0.0/14 && ip4.dst == 10.128.0.0/14, priority 102, uuid 8a306a40
+    reg8[0..15] = 0;
+    next;
+16. lr_in_policy_ecmp (northd.c:12248): reg8[0..15] == 0, priority 150, uuid 9cb3bb4f
+    next;
+17. lr_in_arp_resolve (northd.c:12455): outport == "rtos-worker-2.aygarg.example.com" && reg0 == 10.129.2.9, priority 100, uuid 4712eeae
+    eth.dst = 0a:58:0a:81:02:09;
+    next;
+20. lr_in_gw_redirect (northd.c:12853): outport == "rtos-worker-2.aygarg.example.com", priority 50, uuid 2bfc9a1c
+    outport = "cr-rtos-worker-2.aygarg.example.com";
+    next;
+21. lr_in_arp_request (northd.c:12969): 1, priority 0, uuid d7102543
+    output;
+    /* Replacing type "chassisredirect" outport "cr-rtos-worker-2.aygarg.example.com" with distributed port "rtos-worker-2.aygarg.example.com". */
+
+egress(dp="ovn_cluster_router", inport="rtos-worker-1.aygarg.example.com", outport="rtos-worker-2.aygarg.example.com")
+----------------------------------------------------------------------------------------------------------------------------------------------
+ 0. lr_out_chk_dnat_local (northd.c:14250): 1, priority 0, uuid 281b37c0
+    reg9[4] = 0;
+    next;
+ 6. lr_out_delivery (northd.c:13017): outport == "rtos-worker-2.aygarg.example.com", priority 100, uuid 380f4e5e
+    output;
+    /* output to "rtos-worker-2.aygarg.example.com", type "patch" */
+
+ingress(dp="worker-2.aygarg.example.com", inport="stor-worker-2.aygarg.example.com")
+------------------------------------------------------------------------------------------------------------
+ 0. ls_in_check_port_sec (northd.c:8410): 1, priority 50, uuid 5aba4ca0
+    reg0[15] = check_in_port_sec();
+    next;
+ 4. ls_in_pre_acl (northd.c:5755): ip && inport == "stor-worker-2.aygarg.example.com", priority 110, uuid cc70f427
+    next;
+ 5. ls_in_pre_lb (northd.c:5755): ip && inport == "stor-worker-2.aygarg.example.com", priority 110, uuid 99f2387f
+    next;
+ 7. ls_in_acl_hint (northd.c:6159): !ct.new && ct.est && !ct.rpl && ct_mark.blocked == 0, priority 4, uuid ee05988c
+    reg0[8] = 1;
+    reg0[10] = 1;
+    next;
+14. ls_in_pre_hairpin (northd.c:7616): ip && ct.trk, priority 100, uuid 700253a5
+    reg0[6] = chk_lb_hairpin();
+    reg0[12] = chk_lb_hairpin_reply();
+    next;
+25. ls_in_l2_lkup (northd.c:9076): eth.dst == 0a:58:0a:81:02:09, priority 50, uuid 56187e94
+    outport = "test-label_httpd-67d9dd4546-h2bp8";
+    output;
+
+egress(dp="worker-2.aygarg.example.com", inport="stor-worker-2.aygarg.example.com", outport="test-label_httpd-67d9dd4546-h2bp8")
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ 0. ls_out_pre_lb (northd.c:6040): ip, priority 100, uuid 02d367b6
+    reg0[2] = 1;
+    next;
+ 1. ls_out_pre_acl (northd.c:5870): ip, priority 100, uuid 1aab00a9
+    reg0[0] = 1;
+    next;
+ 2. ls_out_pre_stateful (northd.c:6064): reg0[2] == 1, priority 110, uuid a7399496
+    ct_lb_mark;
+
+ct_lb_mark /* default (use --ct to customize) */
+------------------------------------------------
+ 3. ls_out_acl_hint (northd.c:6159): !ct.new && ct.est && !ct.rpl && ct_mark.blocked == 0, priority 4, uuid 79c5913c
+    reg0[8] = 1;
+    reg0[10] = 1;
+    next;
+ 8. ls_out_check_port_sec (northd.c:5724): 1, priority 0, uuid 4bb43fc3
+    reg0[15] = check_out_port_sec();
+    next;
+ 9. ls_out_apply_port_sec (northd.c:5729): 1, priority 0, uuid 19eeb67a
+    output;
+    /* output to "test-label_httpd-67d9dd4546-h2bp8", type "" */
+[0m
+[32m[1movn-trace destination pod to source pod indicates success from httpd-67d9dd4546-sztcr to httpd-67d9dd4546-h2bp8[0m
+I0420 09:36:05.584377   22647 ovnkube-trace.go:626] [32mSearch string matched:
+output to "test-label_httpd-67d9dd4546-h2bp8"[0m
+I0420 09:36:05.670315   22647 ovnkube-trace.go:615] ovs-appctl ofproto/trace source pod to destination pod Output:
+[3mFlow: tcp,in_port=14,vlan_tci=0x0000,dl_src=0a:58:0a:81:02:09,dl_dst=0a:58:0a:81:02:01,nw_src=10.129.2.9,nw_dst=10.131.0.28,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=12345,tp_dst=8080,tcp_flags=0
+
+bridge("br-int")
+----------------
+ 0. in_port=14, priority 100, cookie 0xcad6a2c4
+    set_field:0xf->reg13
+    set_field:0x5->reg11
+    set_field:0x2->reg12
+    set_field:0x12->metadata
+    set_field:0x9->reg14
+    resubmit(,8)
+ 8. metadata=0x12, priority 50, cookie 0x5aba4ca0
+    set_field:0/0x1000->reg10
+    resubmit(,73)
+    73. ip,reg14=0x9,metadata=0x12,dl_src=0a:58:0a:81:02:09,nw_src=10.129.2.9, priority 90, cookie 0xcad6a2c4
+            set_field:0/0x1000->reg10
+    move:NXM_NX_REG10[12]->NXM_NX_XXREG0[111]
+     -> NXM_NX_XXREG0[111] is now 0
+    resubmit(,9)
+ 9. metadata=0x12, priority 0, cookie 0xf3e6ead9
+    resubmit(,10)
+10. metadata=0x12, priority 0, cookie 0xa811b2fe
+    resubmit(,11)
+11. metadata=0x12, priority 0, cookie 0x9e6ebe89
+    resubmit(,12)
+12. ip,metadata=0x12, priority 100, cookie 0x45bf886a
+    set_field:0x1000000000000000000000000/0x1000000000000000000000000->xxreg0
+    resubmit(,13)
+13. ip,metadata=0x12, priority 100, cookie 0xf55a2d7
+    set_field:0x4000000000000000000000000/0x4000000000000000000000000->xxreg0
+    resubmit(,14)
+14. ip,reg0=0x4/0x4,metadata=0x12, priority 110, cookie 0x22d08286
+    ct(table=15,zone=NXM_NX_REG13[0..15],nat)
+    nat
+     -> A clone of the packet is forked to recirculate. The forked pipeline will be resumed at table 15.
+     -> Sets the packet to an untracked state, and clears all the conntrack fields.
+
+Final flow: tcp,reg0=0x5,reg11=0x5,reg12=0x2,reg13=0xf,reg14=0x9,metadata=0x12,in_port=14,vlan_tci=0x0000,dl_src=0a:58:0a:81:02:09,dl_dst=0a:58:0a:81:02:01,nw_src=10.129.2.9,nw_dst=10.131.0.28,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=12345,tp_dst=8080,tcp_flags=0
+Megaflow: recirc_id=0,eth,tcp,in_port=14,dl_src=0a:58:0a:81:02:09,dl_dst=0a:58:0a:81:02:01,nw_src=10.129.2.9,nw_dst=0.0.0.0/1,nw_frag=no
+Datapath actions: ct(zone=15,nat),recirc(0x2727f)
+
+===============================================================================
+recirc(0x2727f) - resume conntrack with default ct_state=trk|new (use --ct-next to customize)
+Replacing src/dst IP/ports to simulate NAT:
+ Initial flow: 
+ Modified flow: 
+===============================================================================
+
+Flow: recirc_id=0x2727f,ct_state=new|trk,ct_zone=15,eth,tcp,reg0=0x5,reg11=0x5,reg12=0x2,reg13=0xf,reg14=0x9,metadata=0x12,in_port=14,vlan_tci=0x0000,dl_src=0a:58:0a:81:02:09,dl_dst=0a:58:0a:81:02:01,nw_src=10.129.2.9,nw_dst=10.131.0.28,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=12345,tp_dst=8080,tcp_flags=0
+
+bridge("br-int")
+----------------
+    thaw
+        Resuming from table 15
+15. ct_state=+new-est+trk,metadata=0x12, priority 7, cookie 0xd4f0dc90
+    set_field:0x80000000000000000000000000/0x80000000000000000000000000->xxreg0
+    set_field:0x200000000000000000000000000/0x200000000000000000000000000->xxreg0
+    resubmit(,16)
+16. ct_state=-est+trk,ip,metadata=0x12, priority 1, cookie 0x970f2255
+    set_field:0x2000000000000000000000000/0x2000000000000000000000000->xxreg0
+    resubmit(,17)
+17. metadata=0x12, priority 0, cookie 0xa7fd0bc7
+    resubmit(,18)
+18. metadata=0x12, priority 0, cookie 0x57c6a5b4
+    resubmit(,19)
+19. metadata=0x12, priority 0, cookie 0xc77d4848
+    resubmit(,20)
+20. metadata=0x12, priority 0, cookie 0xfa9b2748
+    resubmit(,21)
+21. metadata=0x12, priority 0, cookie 0xf2e8c077
+    resubmit(,22)
+22. ct_state=+trk,ip,metadata=0x12, priority 100, cookie 0x700253a5
+    set_field:0/0x80->reg10
+    resubmit(,68)
+    68. No match.
+            drop
+    move:NXM_NX_REG10[7]->NXM_NX_XXREG0[102]
+     -> NXM_NX_XXREG0[102] is now 0
+    set_field:0/0x80->reg10
+    resubmit(,69)
+    69. No match.
+            drop
+    move:NXM_NX_REG10[7]->NXM_NX_XXREG0[108]
+     -> NXM_NX_XXREG0[108] is now 0
+    resubmit(,23)
+23. metadata=0x12, priority 0, cookie 0xe2d770f6
+    resubmit(,24)
+24. metadata=0x12, priority 0, cookie 0x2f74c955
+    resubmit(,25)
+25. metadata=0x12, priority 0, cookie 0x78dc1d34
+    resubmit(,26)
+26. ip,reg0=0x2/0x2002,metadata=0x12, priority 100, cookie 0x462ab84b
+    ct(commit,zone=NXM_NX_REG13[0..15],nat(src),exec(set_field:0/0x1->ct_mark))
+    nat(src)
+    set_field:0/0x1->ct_mark
+     -> Sets the packet to an untracked state, and clears all the conntrack fields.
+    resubmit(,27)
+27. metadata=0x12, priority 0, cookie 0xa7060400
+    resubmit(,28)
+28. metadata=0x12, priority 0, cookie 0x14253cff
+    resubmit(,29)
+29. metadata=0x12, priority 0, cookie 0x162f2faa
+    resubmit(,30)
+30. metadata=0x12, priority 0, cookie 0x2817620b
+    resubmit(,31)
+31. metadata=0x12, priority 0, cookie 0x50fa26d2
+    resubmit(,32)
+32. metadata=0x12, priority 0, cookie 0x57e03e44
+    resubmit(,33)
+33. metadata=0x12,dl_dst=0a:58:0a:81:02:01, priority 50, cookie 0x25b9058
+    set_field:0x1->reg15
+    resubmit(,37)
+37. priority 0
+    resubmit(,38)
+38. reg15=0x1,metadata=0x12, priority 100, cookie 0x1846b995
+    set_field:0x5->reg11
+    set_field:0x2->reg12
+    resubmit(,39)
+39. priority 0
+    set_field:0->reg0
+    set_field:0->reg1
+    set_field:0->reg2
+    set_field:0->reg3
+    set_field:0->reg4
+    set_field:0->reg5
+    set_field:0->reg6
+    set_field:0->reg7
+    set_field:0->reg8
+    set_field:0->reg9
+    resubmit(,40)
+40. ip,reg15=0x1,metadata=0x12, priority 110, cookie 0xe5ba8c50
+    resubmit(,41)
+41. ip,reg15=0x1,metadata=0x12, priority 110, cookie 0xb6375457
+    resubmit(,42)
+42. metadata=0x12, priority 0, cookie 0xcf812695
+    resubmit(,43)
+43. ct_state=-trk,metadata=0x12, priority 5, cookie 0x7f1d2b2
+    set_field:0x100000000000000000000000000/0x100000000000000000000000000->xxreg0
+    set_field:0x200000000000000000000000000/0x200000000000000000000000000->xxreg0
+    resubmit(,44)
+44. metadata=0x12, priority 0, cookie 0xec17136c
+    resubmit(,45)
+45. metadata=0x12, priority 0, cookie 0xda476012
+    resubmit(,46)
+46. metadata=0x12, priority 0, cookie 0x6c235daa
+    resubmit(,47)
+47. metadata=0x12, priority 0, cookie 0xc9f354ab
+    resubmit(,48)
+48. metadata=0x12, priority 0, cookie 0x4bb43fc3
+    set_field:0/0x1000->reg10
+    resubmit(,75)
+    75. No match.
+            drop
+    move:NXM_NX_REG10[12]->NXM_NX_XXREG0[111]
+     -> NXM_NX_XXREG0[111] is now 0
+    resubmit(,49)
+49. metadata=0x12, priority 0, cookie 0x19eeb67a
+    resubmit(,64)
+64. priority 0
+    resubmit(,65)
+65. reg15=0x1,metadata=0x12, priority 100, cookie 0x1846b995
+    clone(ct_clear,set_field:0->reg11,set_field:0->reg12,set_field:0->reg13,set_field:0x6->reg11,set_field:0x1->reg12,set_field:0xa->metadata,set_field:0xc->reg14,set_field:0->reg10,set_field:0->reg15,set_field:0->reg0,set_field:0->reg1,set_field:0->reg2,set_field:0->reg3,set_field:0->reg4,set_field:0->reg5,set_field:0->reg6,set_field:0->reg7,set_field:0->reg8,set_field:0->reg9,resubmit(,8))
+    ct_clear
+    set_field:0->reg11
+    set_field:0->reg12
+    set_field:0->reg13
+    set_field:0x6->reg11
+    set_field:0x1->reg12
+    set_field:0xa->metadata
+    set_field:0xc->reg14
+    set_field:0->reg10
+    set_field:0->reg15
+    set_field:0->reg0
+    set_field:0->reg1
+    set_field:0->reg2
+    set_field:0->reg3
+    set_field:0->reg4
+    set_field:0->reg5
+    set_field:0->reg6
+    set_field:0->reg7
+    set_field:0->reg8
+    set_field:0->reg9
+    resubmit(,8)
+ 8. reg14=0xc,metadata=0xa,dl_dst=0a:58:0a:81:02:01, priority 50, cookie 0xeac4244
+    set_field:0xa580a8102010000000000000000/0xffffffffffff0000000000000000->xxreg0
+    resubmit(,9)
+ 9. metadata=0xa, priority 0, cookie 0xa52f6fb4
+    set_field:0x4/0x4->xreg4
+    resubmit(,10)
+10. reg9=0x4/0x4,metadata=0xa, priority 100, cookie 0xb12e07d7
+    resubmit(,11)
+11. metadata=0xa, priority 0, cookie 0x88a1832c
+    resubmit(,12)
+12. metadata=0xa, priority 0, cookie 0xac630afa
+    resubmit(,13)
+13. metadata=0xa, priority 0, cookie 0xea546619
+    resubmit(,14)
+14. metadata=0xa, priority 0, cookie 0xaaace7f1
+    resubmit(,15)
+15. metadata=0xa, priority 0, cookie 0xce56baa
+    resubmit(,16)
+16. metadata=0xa, priority 0, cookie 0xbc84fcdc
+    resubmit(,17)
+17. metadata=0xa, priority 0, cookie 0x1d51e88f
+    resubmit(,18)
+18. metadata=0xa, priority 0, cookie 0xf475b505
+    resubmit(,19)
+19. metadata=0xa, priority 0, cookie 0xec55c35
+    resubmit(,20)
+20. metadata=0xa, priority 0, cookie 0xf0f9778b
+    set_field:0/0xffffffff->xxreg1
+    resubmit(,21)
+21. ip,metadata=0xa,nw_dst=10.131.0.0/23, priority 71, cookie 0x5a6ca1b1
+    dec_ttl()
+    set_field:0/0xffff00000000->xreg4
+    move:NXM_OF_IP_DST[]->NXM_NX_XXREG0[96..127]
+     -> NXM_NX_XXREG0[96..127] is now 0xa83001c
+    set_field:0xa8300010000000000000000/0xffffffff0000000000000000->xxreg0
+    set_field:0a:58:0a:83:00:01->eth_src
+    set_field:0x8->reg15
+    set_field:0x1/0x1->reg10
+    resubmit(,22)
+22. reg8=0/0xffff,metadata=0xa, priority 150, cookie 0xa45c00c0
+    resubmit(,23)
+23. ip,metadata=0xa,nw_src=10.128.0.0/14,nw_dst=10.128.0.0/14, priority 102, cookie 0x8a306a40
+    set_field:0/0xffff00000000->xreg4
+    resubmit(,24)
+24. reg8=0/0xffff,metadata=0xa, priority 150, cookie 0x9cb3bb4f
+    resubmit(,25)
+25. reg0=0xa83001c,reg15=0x8,metadata=0xa, priority 100, cookie 0x10b79ffc
+    set_field:0a:58:0a:83:00:1c->eth_dst
+    resubmit(,26)
+26. metadata=0xa, priority 0, cookie 0x84b7889f
+    resubmit(,27)
+27. metadata=0xa, priority 0, cookie 0xdedfbdc2
+    resubmit(,28)
+28. reg15=0x8,metadata=0xa, priority 50, cookie 0x31413f3f
+    set_field:0xa->reg15
+    resubmit(,29)
+29. metadata=0xa, priority 0, cookie 0xd7102543
+    resubmit(,37)
+37. reg15=0xa,metadata=0xa, priority 100, cookie 0x23422676
+    set_field:0xa/0xffffff->tun_id
+    set_field:0xa->tun_metadata0
+    move:NXM_NX_REG14[0..14]->NXM_NX_TUN_METADATA0[16..30]
+     -> NXM_NX_TUN_METADATA0[16..30] is now 0xc
+    output:2
+     -> output to kernel tunnel
+    resubmit(,38)
+38. priority 0
+    drop
+
+Final flow: recirc_id=0x2727f,eth,tcp,reg0=0x300,reg11=0x5,reg12=0x2,reg13=0xf,reg14=0x9,reg15=0x1,metadata=0x12,in_port=14,vlan_tci=0x0000,dl_src=0a:58:0a:81:02:09,dl_dst=0a:58:0a:81:02:01,nw_src=10.129.2.9,nw_dst=10.131.0.28,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=12345,tp_dst=8080,tcp_flags=0
+Megaflow: recirc_id=0x2727f,ct_state=+new-est-rel-rpl-inv+trk,ct_mark=0/0xf,eth,tcp,in_port=14,dl_src=0a:58:0a:81:02:09,dl_dst=0a:58:0a:81:02:01,nw_src=10.129.2.8/29,nw_dst=10.131.0.28,nw_ecn=0,nw_ttl=64,nw_frag=no
+Datapath actions: ct(commit,zone=15,mark=0/0x1,nat(src)),set(tunnel(tun_id=0xa,dst=10.74.211.238,ttl=64,tp_dst=6081,geneve({class=0x102,type=0x80,len=4,0xc000a}),flags(df|csum|key))),set(eth(src=0a:58:0a:83:00:01,dst=0a:58:0a:83:00:1c)),set(ipv4(ttl=63)),5
+[0m
+[32m[1movs-appctl ofproto/trace source pod to destination pod indicates success from httpd-67d9dd4546-h2bp8 to httpd-67d9dd4546-sztcr[0m
+I0420 09:36:05.670391   22647 ovnkube-trace.go:626] [32mSearch string matched:
+-> output to kernel tunnel[0m
+I0420 09:36:05.745065   22647 ovnkube-trace.go:615] ovs-appctl ofproto/trace destination pod to source pod Output:
+[3mFlow: tcp,in_port=32,vlan_tci=0x0000,dl_src=0a:58:0a:83:00:1c,dl_dst=0a:58:0a:83:00:01,nw_src=10.131.0.28,nw_dst=10.129.2.9,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=12345,tp_dst=8080,tcp_flags=0
+
+bridge("br-int")
+----------------
+ 0. in_port=32, priority 100, cookie 0xa181cdae
+    set_field:0x7->reg13
+    set_field:0x6->reg11
+    set_field:0x1->reg12
+    set_field:0xc->metadata
+    set_field:0x13->reg14
+    resubmit(,8)
+ 8. metadata=0xc, priority 50, cookie 0x5aba4ca0
+    set_field:0/0x1000->reg10
+    resubmit(,73)
+    73. ip,reg14=0x13,metadata=0xc,dl_src=0a:58:0a:83:00:1c,nw_src=10.131.0.28, priority 90, cookie 0xa181cdae
+            set_field:0/0x1000->reg10
+    move:NXM_NX_REG10[12]->NXM_NX_XXREG0[111]
+     -> NXM_NX_XXREG0[111] is now 0
+    resubmit(,9)
+ 9. metadata=0xc, priority 0, cookie 0xf3e6ead9
+    resubmit(,10)
+10. metadata=0xc, priority 0, cookie 0xa811b2fe
+    resubmit(,11)
+11. metadata=0xc, priority 0, cookie 0x9e6ebe89
+    resubmit(,12)
+12. ip,metadata=0xc, priority 100, cookie 0x45bf886a
+    set_field:0x1000000000000000000000000/0x1000000000000000000000000->xxreg0
+    resubmit(,13)
+13. ip,metadata=0xc, priority 100, cookie 0xf55a2d7
+    set_field:0x4000000000000000000000000/0x4000000000000000000000000->xxreg0
+    resubmit(,14)
+14. ip,reg0=0x4/0x4,metadata=0xc, priority 110, cookie 0x22d08286
+    ct(table=15,zone=NXM_NX_REG13[0..15],nat)
+    nat
+     -> A clone of the packet is forked to recirculate. The forked pipeline will be resumed at table 15.
+     -> Sets the packet to an untracked state, and clears all the conntrack fields.
+
+Final flow: tcp,reg0=0x5,reg11=0x6,reg12=0x1,reg13=0x7,reg14=0x13,metadata=0xc,in_port=32,vlan_tci=0x0000,dl_src=0a:58:0a:83:00:1c,dl_dst=0a:58:0a:83:00:01,nw_src=10.131.0.28,nw_dst=10.129.2.9,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=12345,tp_dst=8080,tcp_flags=0
+Megaflow: recirc_id=0,eth,tcp,in_port=32,dl_src=0a:58:0a:83:00:1c,dl_dst=0a:58:0a:83:00:01,nw_src=10.131.0.28,nw_dst=0.0.0.0/1,nw_frag=no
+Datapath actions: ct(zone=7,nat),recirc(0x64cc0)
+
+===============================================================================
+recirc(0x64cc0) - resume conntrack with default ct_state=trk|new (use --ct-next to customize)
+Replacing src/dst IP/ports to simulate NAT:
+ Initial flow: 
+ Modified flow: 
+===============================================================================
+
+Flow: recirc_id=0x64cc0,ct_state=new|trk,ct_zone=7,eth,tcp,reg0=0x5,reg11=0x6,reg12=0x1,reg13=0x7,reg14=0x13,metadata=0xc,in_port=32,vlan_tci=0x0000,dl_src=0a:58:0a:83:00:1c,dl_dst=0a:58:0a:83:00:01,nw_src=10.131.0.28,nw_dst=10.129.2.9,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=12345,tp_dst=8080,tcp_flags=0
+
+bridge("br-int")
+----------------
+    thaw
+        Resuming from table 15
+15. ct_state=+new-est+trk,metadata=0xc, priority 7, cookie 0xd4f0dc90
+    set_field:0x80000000000000000000000000/0x80000000000000000000000000->xxreg0
+    set_field:0x200000000000000000000000000/0x200000000000000000000000000->xxreg0
+    resubmit(,16)
+16. ct_state=-est+trk,ip,metadata=0xc, priority 1, cookie 0x970f2255
+    set_field:0x2000000000000000000000000/0x2000000000000000000000000->xxreg0
+    resubmit(,17)
+17. metadata=0xc, priority 0, cookie 0xa7fd0bc7
+    resubmit(,18)
+18. metadata=0xc, priority 0, cookie 0x57c6a5b4
+    resubmit(,19)
+19. metadata=0xc, priority 0, cookie 0xc77d4848
+    resubmit(,20)
+20. metadata=0xc, priority 0, cookie 0xfa9b2748
+    resubmit(,21)
+21. metadata=0xc, priority 0, cookie 0xf2e8c077
+    resubmit(,22)
+22. ct_state=+trk,ip,metadata=0xc, priority 100, cookie 0x700253a5
+    set_field:0/0x80->reg10
+    resubmit(,68)
+    68. No match.
+            drop
+    move:NXM_NX_REG10[7]->NXM_NX_XXREG0[102]
+     -> NXM_NX_XXREG0[102] is now 0
+    set_field:0/0x80->reg10
+    resubmit(,69)
+    69. No match.
+            drop
+    move:NXM_NX_REG10[7]->NXM_NX_XXREG0[108]
+     -> NXM_NX_XXREG0[108] is now 0
+    resubmit(,23)
+23. metadata=0xc, priority 0, cookie 0xe2d770f6
+    resubmit(,24)
+24. metadata=0xc, priority 0, cookie 0x2f74c955
+    resubmit(,25)
+25. metadata=0xc, priority 0, cookie 0x78dc1d34
+    resubmit(,26)
+26. ip,reg0=0x2/0x2002,metadata=0xc, priority 100, cookie 0x462ab84b
+    ct(commit,zone=NXM_NX_REG13[0..15],nat(src),exec(set_field:0/0x1->ct_mark))
+    nat(src)
+    set_field:0/0x1->ct_mark
+     -> Sets the packet to an untracked state, and clears all the conntrack fields.
+    resubmit(,27)
+27. metadata=0xc, priority 0, cookie 0xa7060400
+    resubmit(,28)
+28. metadata=0xc, priority 0, cookie 0x14253cff
+    resubmit(,29)
+29. metadata=0xc, priority 0, cookie 0x162f2faa
+    resubmit(,30)
+30. metadata=0xc, priority 0, cookie 0x2817620b
+    resubmit(,31)
+31. metadata=0xc, priority 0, cookie 0x50fa26d2
+    resubmit(,32)
+32. metadata=0xc, priority 0, cookie 0x57e03e44
+    resubmit(,33)
+33. metadata=0xc,dl_dst=0a:58:0a:83:00:01, priority 50, cookie 0x2e1b5291
+    set_field:0x1->reg15
+    resubmit(,37)
+37. priority 0
+    resubmit(,38)
+38. reg15=0x1,metadata=0xc, priority 100, cookie 0x813f6473
+    set_field:0x6->reg11
+    set_field:0x1->reg12
+    resubmit(,39)
+39. priority 0
+    set_field:0->reg0
+    set_field:0->reg1
+    set_field:0->reg2
+    set_field:0->reg3
+    set_field:0->reg4
+    set_field:0->reg5
+    set_field:0->reg6
+    set_field:0->reg7
+    set_field:0->reg8
+    set_field:0->reg9
+    resubmit(,40)
+40. ip,reg15=0x1,metadata=0xc, priority 110, cookie 0x834e6aa3
+    resubmit(,41)
+41. ip,reg15=0x1,metadata=0xc, priority 110, cookie 0x9cc1b937
+    resubmit(,42)
+42. metadata=0xc, priority 0, cookie 0xcf812695
+    resubmit(,43)
+43. ct_state=-trk,metadata=0xc, priority 5, cookie 0x7f1d2b2
+    set_field:0x100000000000000000000000000/0x100000000000000000000000000->xxreg0
+    set_field:0x200000000000000000000000000/0x200000000000000000000000000->xxreg0
+    resubmit(,44)
+44. metadata=0xc, priority 0, cookie 0xec17136c
+    resubmit(,45)
+45. metadata=0xc, priority 0, cookie 0xda476012
+    resubmit(,46)
+46. metadata=0xc, priority 0, cookie 0x6c235daa
+    resubmit(,47)
+47. metadata=0xc, priority 0, cookie 0xc9f354ab
+    resubmit(,48)
+48. metadata=0xc, priority 0, cookie 0x4bb43fc3
+    set_field:0/0x1000->reg10
+    resubmit(,75)
+    75. No match.
+            drop
+    move:NXM_NX_REG10[12]->NXM_NX_XXREG0[111]
+     -> NXM_NX_XXREG0[111] is now 0
+    resubmit(,49)
+49. metadata=0xc, priority 0, cookie 0x19eeb67a
+    resubmit(,64)
+64. priority 0
+    resubmit(,65)
+65. reg15=0x1,metadata=0xc, priority 100, cookie 0x813f6473
+    clone(ct_clear,set_field:0->reg11,set_field:0->reg12,set_field:0->reg13,set_field:0x8->reg11,set_field:0x4->reg12,set_field:0xa->metadata,set_field:0x8->reg14,set_field:0->reg10,set_field:0->reg15,set_field:0->reg0,set_field:0->reg1,set_field:0->reg2,set_field:0->reg3,set_field:0->reg4,set_field:0->reg5,set_field:0->reg6,set_field:0->reg7,set_field:0->reg8,set_field:0->reg9,resubmit(,8))
+    ct_clear
+    set_field:0->reg11
+    set_field:0->reg12
+    set_field:0->reg13
+    set_field:0x8->reg11
+    set_field:0x4->reg12
+    set_field:0xa->metadata
+    set_field:0x8->reg14
+    set_field:0->reg10
+    set_field:0->reg15
+    set_field:0->reg0
+    set_field:0->reg1
+    set_field:0->reg2
+    set_field:0->reg3
+    set_field:0->reg4
+    set_field:0->reg5
+    set_field:0->reg6
+    set_field:0->reg7
+    set_field:0->reg8
+    set_field:0->reg9
+    resubmit(,8)
+ 8. reg14=0x8,metadata=0xa,dl_dst=0a:58:0a:83:00:01, priority 50, cookie 0xe57bbf7
+    set_field:0xa580a8300010000000000000000/0xffffffffffff0000000000000000->xxreg0
+    resubmit(,9)
+ 9. metadata=0xa, priority 0, cookie 0xa52f6fb4
+    set_field:0x4/0x4->xreg4
+    resubmit(,10)
+10. reg9=0x4/0x4,metadata=0xa, priority 100, cookie 0xb12e07d7
+    resubmit(,11)
+11. metadata=0xa, priority 0, cookie 0x88a1832c
+    resubmit(,12)
+12. metadata=0xa, priority 0, cookie 0xac630afa
+    resubmit(,13)
+13. metadata=0xa, priority 0, cookie 0xea546619
+    resubmit(,14)
+14. metadata=0xa, priority 0, cookie 0xaaace7f1
+    resubmit(,15)
+15. metadata=0xa, priority 0, cookie 0xce56baa
+    resubmit(,16)
+16. metadata=0xa, priority 0, cookie 0xbc84fcdc
+    resubmit(,17)
+17. metadata=0xa, priority 0, cookie 0x1d51e88f
+    resubmit(,18)
+18. metadata=0xa, priority 0, cookie 0xf475b505
+    resubmit(,19)
+19. metadata=0xa, priority 0, cookie 0xec55c35
+    resubmit(,20)
+20. metadata=0xa, priority 0, cookie 0xf0f9778b
+    set_field:0/0xffffffff->xxreg1
+    resubmit(,21)
+21. ip,metadata=0xa,nw_dst=10.129.2.0/23, priority 71, cookie 0x15cb4afd
+    dec_ttl()
+    set_field:0/0xffff00000000->xreg4
+    move:NXM_OF_IP_DST[]->NXM_NX_XXREG0[96..127]
+     -> NXM_NX_XXREG0[96..127] is now 0xa810209
+    set_field:0xa8102010000000000000000/0xffffffff0000000000000000->xxreg0
+    set_field:0a:58:0a:81:02:01->eth_src
+    set_field:0xc->reg15
+    set_field:0x1/0x1->reg10
+    resubmit(,22)
+22. reg8=0/0xffff,metadata=0xa, priority 150, cookie 0xa45c00c0
+    resubmit(,23)
+23. ip,metadata=0xa,nw_src=10.128.0.0/14,nw_dst=10.128.0.0/14, priority 102, cookie 0x8a306a40
+    set_field:0/0xffff00000000->xreg4
+    resubmit(,24)
+24. reg8=0/0xffff,metadata=0xa, priority 150, cookie 0x9cb3bb4f
+    resubmit(,25)
+25. reg0=0xa810209,reg15=0xc,metadata=0xa, priority 100, cookie 0x4712eeae
+    set_field:0a:58:0a:81:02:09->eth_dst
+    resubmit(,26)
+26. metadata=0xa, priority 0, cookie 0x84b7889f
+    resubmit(,27)
+27. metadata=0xa, priority 0, cookie 0xdedfbdc2
+    resubmit(,28)
+28. reg15=0xc,metadata=0xa, priority 50, cookie 0x2bfc9a1c
+    set_field:0xd->reg15
+    resubmit(,29)
+29. metadata=0xa, priority 0, cookie 0xd7102543
+    resubmit(,37)
+37. reg15=0xd,metadata=0xa, priority 100, cookie 0x768deda0
+    set_field:0xa/0xffffff->tun_id
+    set_field:0xd->tun_metadata0
+    move:NXM_NX_REG14[0..14]->NXM_NX_TUN_METADATA0[16..30]
+     -> NXM_NX_TUN_METADATA0[16..30] is now 0x8
+    output:22
+     -> output to kernel tunnel
+    resubmit(,38)
+38. priority 0
+    drop
+
+Final flow: recirc_id=0x64cc0,eth,tcp,reg0=0x300,reg11=0x6,reg12=0x1,reg13=0x7,reg14=0x13,reg15=0x1,metadata=0xc,in_port=32,vlan_tci=0x0000,dl_src=0a:58:0a:83:00:1c,dl_dst=0a:58:0a:83:00:01,nw_src=10.131.0.28,nw_dst=10.129.2.9,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=12345,tp_dst=8080,tcp_flags=0
+Megaflow: recirc_id=0x64cc0,ct_state=+new-est-rel-rpl-inv+trk,ct_mark=0/0xf,eth,tcp,in_port=32,dl_src=0a:58:0a:83:00:1c,dl_dst=0a:58:0a:83:00:01,nw_src=10.131.0.16/28,nw_dst=10.129.2.9,nw_ecn=0,nw_ttl=64,nw_frag=no
+Datapath actions: ct(commit,zone=7,mark=0/0x1,nat(src)),set(tunnel(tun_id=0xa,dst=10.74.210.74,ttl=64,tp_dst=6081,geneve({class=0x102,type=0x80,len=4,0x8000d}),flags(df|csum|key))),set(eth(src=0a:58:0a:81:02:01,dst=0a:58:0a:81:02:09)),set(ipv4(ttl=63)),4
+[0m
+[32m[1movs-appctl ofproto/trace destination pod to source pod indicates success from httpd-67d9dd4546-sztcr to httpd-67d9dd4546-h2bp8[0m
+I0420 09:36:05.745158   22647 ovnkube-trace.go:626] [32mSearch string matched:
+-> output to kernel tunnel[0m
+I0420 09:36:07.187910   22647 ovnkube-trace.go:615] ovn-detrace source pod to destination pod Output:
+[3mFlow: tcp,in_port=14,vlan_tci=0x0000,dl_src=0a:58:0a:81:02:09,dl_dst=0a:58:0a:81:02:01,nw_src=10.129.2.9,nw_dst=10.131.0.28,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=12345,tp_dst=8080,tcp_flags=0
+
+bridge("br-int")
+----------------
+0. in_port=14, priority 100, cookie 0xcad6a2c4
+set_field:0xf->reg13
+set_field:0x5->reg11
+set_field:0x2->reg12
+set_field:0x12->metadata
+set_field:0x9->reg14
+resubmit(,8)
+  * Logical datapath: "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416)
+  * Port Binding: logical_port "test-label_httpd-67d9dd4546-h2bp8", tunnel_key 9, chassis-name "958aa269-1460-40c2-b81e-16525d79729e", chassis-str "worker-2.aygarg.example.com"
+8. metadata=0x12, priority 50, cookie 0x5aba4ca0
+set_field:0/0x1000->reg10
+resubmit(,73)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=0 (ls_in_check_port_sec), priority=50, match=(1), actions=(reg0[15] = check_in_port_sec(); next;)
+73. ip,reg14=0x9,metadata=0x12,dl_src=0a:58:0a:81:02:09,nw_src=10.129.2.9, priority 90, cookie 0xcad6a2c4
+set_field:0/0x1000->reg10
+move:NXM_NX_REG10[12]->NXM_NX_XXREG0[111]
+-> NXM_NX_XXREG0[111] is now 0
+resubmit(,9)
+  * Logical datapath: "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416)
+  * Port Binding: logical_port "test-label_httpd-67d9dd4546-h2bp8", tunnel_key 9, chassis-name "958aa269-1460-40c2-b81e-16525d79729e", chassis-str "worker-2.aygarg.example.com"
+9. metadata=0x12, priority 0, cookie 0xf3e6ead9
+resubmit(,10)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=1 (ls_in_apply_port_sec), priority=0, match=(1), actions=(next;)
+10. metadata=0x12, priority 0, cookie 0xa811b2fe
+resubmit(,11)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=2 (ls_in_lookup_fdb), priority=0, match=(1), actions=(next;)
+11. metadata=0x12, priority 0, cookie 0x9e6ebe89
+resubmit(,12)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=3 (ls_in_put_fdb), priority=0, match=(1), actions=(next;)
+12. ip,metadata=0x12, priority 100, cookie 0x45bf886a
+set_field:0x1000000000000000000000000/0x1000000000000000000000000->xxreg0
+resubmit(,13)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  * Logical flow: table=4 (ls_in_pre_acl), priority=100, match=(ip), actions=(reg0[0] = 1; next;)
+13. ip,metadata=0x12, priority 100, cookie 0xf55a2d7
+set_field:0x4000000000000000000000000/0x4000000000000000000000000->xxreg0
+resubmit(,14)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  * Logical flow: table=5 (ls_in_pre_lb), priority=100, match=(ip), actions=(reg0[2] = 1; next;)
+14. ip,reg0=0x4/0x4,metadata=0x12, priority 110, cookie 0x22d08286
+ct(table=15,zone=NXM_NX_REG13[0..15],nat)
+nat
+-> A clone of the packet is forked to recirculate. The forked pipeline will be resumed at table 15.
+-> Sets the packet to an untracked state, and clears all the conntrack fields.
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=6 (ls_in_pre_stateful), priority=110, match=(reg0[2] == 1), actions=(ct_lb_mark;)
+
+Final flow: tcp,reg0=0x5,reg11=0x5,reg12=0x2,reg13=0xf,reg14=0x9,metadata=0x12,in_port=14,vlan_tci=0x0000,dl_src=0a:58:0a:81:02:09,dl_dst=0a:58:0a:81:02:01,nw_src=10.129.2.9,nw_dst=10.131.0.28,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=12345,tp_dst=8080,tcp_flags=0
+Megaflow: recirc_id=0,eth,tcp,in_port=14,dl_src=0a:58:0a:81:02:09,dl_dst=0a:58:0a:81:02:01,nw_src=10.129.2.9,nw_dst=0.0.0.0/1,nw_frag=no
+Datapath actions: ct(zone=15,nat),recirc(0x2727f)
+
+===============================================================================
+recirc(0x2727f) - resume conntrack with default ct_state=trk|new (use --ct-next to customize)
+Replacing src/dst IP/ports to simulate NAT:
+Initial flow:
+Modified flow:
+===============================================================================
+
+Flow: recirc_id=0x2727f,ct_state=new|trk,ct_zone=15,eth,tcp,reg0=0x5,reg11=0x5,reg12=0x2,reg13=0xf,reg14=0x9,metadata=0x12,in_port=14,vlan_tci=0x0000,dl_src=0a:58:0a:81:02:09,dl_dst=0a:58:0a:81:02:01,nw_src=10.129.2.9,nw_dst=10.131.0.28,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=12345,tp_dst=8080,tcp_flags=0
+
+bridge("br-int")
+----------------
+thaw
+Resuming from table 15
+15. ct_state=+new-est+trk,metadata=0x12, priority 7, cookie 0xd4f0dc90
+set_field:0x80000000000000000000000000/0x80000000000000000000000000->xxreg0
+set_field:0x200000000000000000000000000/0x200000000000000000000000000->xxreg0
+resubmit(,16)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  * Logical flow: table=7 (ls_in_acl_hint), priority=7, match=(ct.new && !ct.est), actions=(reg0[7] = 1; reg0[9] = 1; next;)
+16. ct_state=-est+trk,ip,metadata=0x12, priority 1, cookie 0x970f2255
+set_field:0x2000000000000000000000000/0x2000000000000000000000000->xxreg0
+resubmit(,17)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  * Logical flow: table=8 (ls_in_acl), priority=1, match=(ip && !ct.est), actions=(reg0[1] = 1; next;)
+17. metadata=0x12, priority 0, cookie 0xa7fd0bc7
+resubmit(,18)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=9 (ls_in_qos_mark), priority=0, match=(1), actions=(next;)
+18. metadata=0x12, priority 0, cookie 0x57c6a5b4
+resubmit(,19)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=10 (ls_in_qos_meter), priority=0, match=(1), actions=(next;)
+19. metadata=0x12, priority 0, cookie 0xc77d4848
+resubmit(,20)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=11 (ls_in_lb_aff_check), priority=0, match=(1), actions=(next;)
+20. metadata=0x12, priority 0, cookie 0xfa9b2748
+resubmit(,21)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=12 (ls_in_lb), priority=0, match=(1), actions=(next;)
+21. metadata=0x12, priority 0, cookie 0xf2e8c077
+resubmit(,22)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=13 (ls_in_lb_aff_learn), priority=0, match=(1), actions=(next;)
+22. ct_state=+trk,ip,metadata=0x12, priority 100, cookie 0x700253a5
+set_field:0/0x80->reg10
+resubmit(,68)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  * Logical flow: table=14 (ls_in_pre_hairpin), priority=100, match=(ip && ct.trk), actions=(reg0[6] = chk_lb_hairpin(); reg0[12] = chk_lb_hairpin_reply(); next;)
+68. No match.
+drop
+move:NXM_NX_REG10[7]->NXM_NX_XXREG0[102]
+-> NXM_NX_XXREG0[102] is now 0
+set_field:0/0x80->reg10
+resubmit(,69)
+69. No match.
+drop
+move:NXM_NX_REG10[7]->NXM_NX_XXREG0[108]
+-> NXM_NX_XXREG0[108] is now 0
+resubmit(,23)
+23. metadata=0x12, priority 0, cookie 0xe2d770f6
+resubmit(,24)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=15 (ls_in_nat_hairpin), priority=0, match=(1), actions=(next;)
+24. metadata=0x12, priority 0, cookie 0x2f74c955
+resubmit(,25)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=16 (ls_in_hairpin), priority=0, match=(1), actions=(next;)
+25. metadata=0x12, priority 0, cookie 0x78dc1d34
+resubmit(,26)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=17 (ls_in_acl_after_lb), priority=0, match=(1), actions=(next;)
+26. ip,reg0=0x2/0x2002,metadata=0x12, priority 100, cookie 0x462ab84b
+ct(commit,zone=NXM_NX_REG13[0..15],nat(src),exec(set_field:0/0x1->ct_mark))
+nat(src)
+set_field:0/0x1->ct_mark
+-> Sets the packet to an untracked state, and clears all the conntrack fields.
+resubmit(,27)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=18 (ls_in_stateful), priority=100, match=(reg0[1] == 1 && reg0[13] == 0), actions=(ct_commit { ct_mark.blocked = 0; }; next;)
+27. metadata=0x12, priority 0, cookie 0xa7060400
+resubmit(,28)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=19 (ls_in_arp_rsp), priority=0, match=(1), actions=(next;)
+28. metadata=0x12, priority 0, cookie 0x14253cff
+resubmit(,29)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=20 (ls_in_dhcp_options), priority=0, match=(1), actions=(next;)
+29. metadata=0x12, priority 0, cookie 0x162f2faa
+resubmit(,30)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=21 (ls_in_dhcp_response), priority=0, match=(1), actions=(next;)
+30. metadata=0x12, priority 0, cookie 0x2817620b
+resubmit(,31)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=22 (ls_in_dns_lookup), priority=0, match=(1), actions=(next;)
+31. metadata=0x12, priority 0, cookie 0x50fa26d2
+resubmit(,32)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=23 (ls_in_dns_response), priority=0, match=(1), actions=(next;)
+32. metadata=0x12, priority 0, cookie 0x57e03e44
+resubmit(,33)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=24 (ls_in_external_port), priority=0, match=(1), actions=(next;)
+33. metadata=0x12,dl_dst=0a:58:0a:81:02:01, priority 50, cookie 0x25b9058
+set_field:0x1->reg15
+resubmit(,37)
+  * Logical datapaths:
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  * Logical flow: table=25 (ls_in_l2_lkup), priority=50, match=(eth.dst == 0a:58:0a:81:02:01), actions=(outport = "stor-worker-2.aygarg.example.com"; output;)
+   * Logical Switch Port: stor-worker-2.aygarg.example.com type router (addresses ['router'], dynamic addresses [], security []
+37. priority 0
+resubmit(,38)
+38. reg15=0x1,metadata=0x12, priority 100, cookie 0x1846b995
+set_field:0x5->reg11
+set_field:0x2->reg12
+resubmit(,39)
+  * Logical datapath: "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416)
+  * Port Binding: logical_port "stor-worker-2.aygarg.example.com", tunnel_key 1, 
+39. priority 0
+set_field:0->reg0
+set_field:0->reg1
+set_field:0->reg2
+set_field:0->reg3
+set_field:0->reg4
+set_field:0->reg5
+set_field:0->reg6
+set_field:0->reg7
+set_field:0->reg8
+set_field:0->reg9
+resubmit(,40)
+40. ip,reg15=0x1,metadata=0x12, priority 110, cookie 0xe5ba8c50
+resubmit(,41)
+  * Logical datapaths:
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  * Logical flow: table=0 (ls_out_pre_lb), priority=110, match=(ip && outport == "stor-worker-2.aygarg.example.com), actions=(next;)
+   * Logical Switch Port: stor-worker-2.aygarg.example.com type router (addresses ['router'], dynamic addresses [], security []
+41. ip,reg15=0x1,metadata=0x12, priority 110, cookie 0xb6375457
+resubmit(,42)
+  * Logical datapaths:
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  * Logical flow: table=1 (ls_out_pre_acl), priority=110, match=(ip && outport == "stor-worker-2.aygarg.example.com), actions=(next;)
+   * Logical Switch Port: stor-worker-2.aygarg.example.com type router (addresses ['router'], dynamic addresses [], security []
+42. metadata=0x12, priority 0, cookie 0xcf812695
+resubmit(,43)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [egress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [egress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [egress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [egress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [egress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [egress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [egress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [egress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [egress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [egress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [egress]
+  * Logical flow: table=2 (ls_out_pre_stateful), priority=0, match=(1), actions=(next;)
+43. ct_state=-trk,metadata=0x12, priority 5, cookie 0x7f1d2b2
+set_field:0x100000000000000000000000000/0x100000000000000000000000000->xxreg0
+set_field:0x200000000000000000000000000/0x200000000000000000000000000->xxreg0
+resubmit(,44)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [egress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [egress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [egress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [egress]
+  * Logical flow: table=3 (ls_out_acl_hint), priority=5, match=(!ct.trk), actions=(reg0[8] = 1; reg0[9] = 1; next;)
+44. metadata=0x12, priority 0, cookie 0xec17136c
+resubmit(,45)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [egress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [egress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [egress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [egress]
+  * Logical flow: table=4 (ls_out_acl), priority=0, match=(1), actions=(next;)
+45. metadata=0x12, priority 0, cookie 0xda476012
+resubmit(,46)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [egress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [egress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [egress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [egress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [egress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [egress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [egress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [egress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [egress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [egress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [egress]
+  * Logical flow: table=5 (ls_out_qos_mark), priority=0, match=(1), actions=(next;)
+46. metadata=0x12, priority 0, cookie 0x6c235daa
+resubmit(,47)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [egress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [egress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [egress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [egress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [egress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [egress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [egress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [egress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [egress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [egress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [egress]
+  * Logical flow: table=6 (ls_out_qos_meter), priority=0, match=(1), actions=(next;)
+47. metadata=0x12, priority 0, cookie 0xc9f354ab
+resubmit(,48)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [egress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [egress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [egress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [egress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [egress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [egress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [egress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [egress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [egress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [egress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [egress]
+  * Logical flow: table=7 (ls_out_stateful), priority=0, match=(1), actions=(next;)
+48. metadata=0x12, priority 0, cookie 0x4bb43fc3
+set_field:0/0x1000->reg10
+resubmit(,75)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [egress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [egress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [egress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [egress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [egress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [egress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [egress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [egress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [egress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [egress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [egress]
+  * Logical flow: table=8 (ls_out_check_port_sec), priority=0, match=(1), actions=(reg0[15] = check_out_port_sec(); next;)
+75. No match.
+drop
+move:NXM_NX_REG10[12]->NXM_NX_XXREG0[111]
+-> NXM_NX_XXREG0[111] is now 0
+resubmit(,49)
+49. metadata=0x12, priority 0, cookie 0x19eeb67a
+resubmit(,64)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [egress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [egress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [egress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [egress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [egress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [egress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [egress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [egress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [egress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [egress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [egress]
+  * Logical flow: table=9 (ls_out_apply_port_sec), priority=0, match=(1), actions=(output;)
+64. priority 0
+resubmit(,65)
+65. reg15=0x1,metadata=0x12, priority 100, cookie 0x1846b995
+clone(ct_clear,set_field:0->reg11,set_field:0->reg12,set_field:0->reg13,set_field:0x6->reg11,set_field:0x1->reg12,set_field:0xa->metadata,set_field:0xc->reg14,set_field:0->reg10,set_field:0->reg15,set_field:0->reg0,set_field:0->reg1,set_field:0->reg2,set_field:0->reg3,set_field:0->reg4,set_field:0->reg5,set_field:0->reg6,set_field:0->reg7,set_field:0->reg8,set_field:0->reg9,resubmit(,8))
+ct_clear
+set_field:0->reg11
+set_field:0->reg12
+set_field:0->reg13
+set_field:0x6->reg11
+set_field:0x1->reg12
+set_field:0xa->metadata
+set_field:0xc->reg14
+set_field:0->reg10
+set_field:0->reg15
+set_field:0->reg0
+set_field:0->reg1
+set_field:0->reg2
+set_field:0->reg3
+set_field:0->reg4
+set_field:0->reg5
+set_field:0->reg6
+set_field:0->reg7
+set_field:0->reg8
+set_field:0->reg9
+resubmit(,8)
+  * Logical datapath: "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416)
+  * Port Binding: logical_port "stor-worker-2.aygarg.example.com", tunnel_key 1, 
+8. reg14=0xc,metadata=0xa,dl_dst=0a:58:0a:81:02:01, priority 50, cookie 0xeac4244
+set_field:0xa580a8102010000000000000000/0xffffffffffff0000000000000000->xxreg0
+resubmit(,9)
+  * Logical datapaths:
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  * Logical flow: table=0 (lr_in_admission), priority=50, match=(eth.dst == 0a:58:0a:81:02:01 && inport == "rtos-worker-2.aygarg.example.com" && is_chassis_resident("cr-rtos-worker-2.aygarg.example.com")), actions=(xreg0[0..47] = 0a:58:0a:81:02:01; next;)
+   * Logical Router Port: rtos-worker-2.aygarg.example.com mac 0a:58:0a:81:02:01 networks ['10.129.2.1/23'] ipv6_ra_configs {}
+9. metadata=0xa, priority 0, cookie 0xa52f6fb4
+set_field:0x4/0x4->xreg4
+resubmit(,10)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=1 (lr_in_lookup_neighbor), priority=0, match=(1), actions=(reg9[2] = 1; next;)
+10. reg9=0x4/0x4,metadata=0xa, priority 100, cookie 0xb12e07d7
+resubmit(,11)
+  * Logical datapaths:
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  * Logical flow: table=2 (lr_in_learn_neighbor), priority=100, match=(reg9[2] == 1), actions=(next;)
+11. metadata=0xa, priority 0, cookie 0x88a1832c
+resubmit(,12)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=3 (lr_in_ip_input), priority=0, match=(1), actions=(next;)
+12. metadata=0xa, priority 0, cookie 0xac630afa
+resubmit(,13)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=4 (lr_in_unsnat), priority=0, match=(1), actions=(next;)
+13. metadata=0xa, priority 0, cookie 0xea546619
+resubmit(,14)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=5 (lr_in_defrag), priority=0, match=(1), actions=(next;)
+14. metadata=0xa, priority 0, cookie 0xaaace7f1
+resubmit(,15)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=6 (lr_in_lb_aff_check), priority=0, match=(1), actions=(next;)
+15. metadata=0xa, priority 0, cookie 0xce56baa
+resubmit(,16)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=7 (lr_in_dnat), priority=0, match=(1), actions=(next;)
+16. metadata=0xa, priority 0, cookie 0xbc84fcdc
+resubmit(,17)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=8 (lr_in_lb_aff_learn), priority=0, match=(1), actions=(next;)
+17. metadata=0xa, priority 0, cookie 0x1d51e88f
+resubmit(,18)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=9 (lr_in_ecmp_stateful), priority=0, match=(1), actions=(next;)
+18. metadata=0xa, priority 0, cookie 0xf475b505
+resubmit(,19)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=10 (lr_in_nd_ra_options), priority=0, match=(1), actions=(next;)
+19. metadata=0xa, priority 0, cookie 0xec55c35
+resubmit(,20)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=11 (lr_in_nd_ra_response), priority=0, match=(1), actions=(next;)
+20. metadata=0xa, priority 0, cookie 0xf0f9778b
+set_field:0/0xffffffff->xxreg1
+resubmit(,21)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=12 (lr_in_ip_routing_pre), priority=0, match=(1), actions=(reg7 = 0; next;)
+21. ip,metadata=0xa,nw_dst=10.131.0.0/23, priority 71, cookie 0x5a6ca1b1
+dec_ttl()
+set_field:0/0xffff00000000->xreg4
+move:NXM_OF_IP_DST[]->NXM_NX_XXREG0[96..127]
+-> NXM_NX_XXREG0[96..127] is now 0xa83001c
+set_field:0xa8300010000000000000000/0xffffffff0000000000000000->xxreg0
+set_field:0a:58:0a:83:00:01->eth_src
+set_field:0x8->reg15
+set_field:0x1/0x1->reg10
+resubmit(,22)
+  * Logical datapaths:
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  * Logical flow: table=13 (lr_in_ip_routing), priority=71, match=(ip4.dst == 10.131.0.0/23), actions=(ip.ttl--; reg8[0..15] = 0; reg0 = ip4.dst; reg1 = 10.131.0.1; eth.src = 0a:58:0a:83:00:01; outport = "rtos-worker-1.aygarg.example.com"; flags.loopback = 1; next;)
+   * Logical Router Port: rtos-worker-1.aygarg.example.com mac 0a:58:0a:83:00:01 networks ['10.131.0.1/23'] ipv6_ra_configs {}
+22. reg8=0/0xffff,metadata=0xa, priority 150, cookie 0xa45c00c0
+resubmit(,23)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=14 (lr_in_ip_routing_ecmp), priority=150, match=(reg8[0..15] == 0), actions=(next;)
+23. ip,metadata=0xa,nw_src=10.128.0.0/14,nw_dst=10.128.0.0/14, priority 102, cookie 0x8a306a40
+set_field:0/0xffff00000000->xreg4
+resubmit(,24)
+  * Logical datapaths:
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  * Logical flow: table=15 (lr_in_policy), priority=102, match=(ip4.src == 10.128.0.0/14 && ip4.dst == 10.128.0.0/14), actions=(reg8[0..15] = 0; next;)
+   * Logical Router Policy: priority 102 match ip4.src == 10.128.0.0/14 && ip4.dst == 10.128.0.0/14 action allow nexthop []
+24. reg8=0/0xffff,metadata=0xa, priority 150, cookie 0x9cb3bb4f
+resubmit(,25)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=16 (lr_in_policy_ecmp), priority=150, match=(reg8[0..15] == 0), actions=(next;)
+25. reg0=0xa83001c,reg15=0x8,metadata=0xa, priority 100, cookie 0x10b79ffc
+set_field:0a:58:0a:83:00:1c->eth_dst
+resubmit(,26)
+  * Logical datapaths:
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  * Logical flow: table=17 (lr_in_arp_resolve), priority=100, match=(outport == "rtos-worker-1.aygarg.example.com" && reg0 == 10.131.0.28), actions=(eth.dst = 0a:58:0a:83:00:1c; next;)
+   * Logical Switch Port: ayush_httpd-67d9dd4546-sztcr type  (addresses ['0a:58:0a:83:00:1c 10.131.0.28'], dynamic addresses [], security ['0a:58:0a:83:00:1c 10.131.0.28']
+26. metadata=0xa, priority 0, cookie 0x84b7889f
+resubmit(,27)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=18 (lr_in_chk_pkt_len), priority=0, match=(1), actions=(next;)
+27. metadata=0xa, priority 0, cookie 0xdedfbdc2
+resubmit(,28)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=19 (lr_in_larger_pkts), priority=0, match=(1), actions=(next;)
+28. reg15=0x8,metadata=0xa, priority 50, cookie 0x31413f3f
+set_field:0xa->reg15
+resubmit(,29)
+  * Logical datapaths:
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  * Logical flow: table=20 (lr_in_gw_redirect), priority=50, match=(outport == "rtos-worker-1.aygarg.example.com), actions=(outport = "cr-rtos-worker-1.aygarg.example.com"; next;)
+   * Logical Router Port: rtos-worker-1.aygarg.example.com mac 0a:58:0a:83:00:01 networks ['10.131.0.1/23'] ipv6_ra_configs {}
+29. metadata=0xa, priority 0, cookie 0xd7102543
+resubmit(,37)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=21 (lr_in_arp_request), priority=0, match=(1), actions=(output;)
+37. reg15=0xa,metadata=0xa, priority 100, cookie 0x23422676
+set_field:0xa/0xffffff->tun_id
+set_field:0xa->tun_metadata0
+move:NXM_NX_REG14[0..14]->NXM_NX_TUN_METADATA0[16..30]
+-> NXM_NX_TUN_METADATA0[16..30] is now 0xc
+output:2
+-> output to kernel tunnel
+resubmit(,38)
+  * Logical datapath: "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73)
+  * Port Binding: logical_port "cr-rtos-worker-1.aygarg.example.com", tunnel_key 10, chassis-name "9355cb41-9010-4704-b9b3-7b46f24cf93d", chassis-str "worker-1.aygarg.example.com"
+38. priority 0
+drop
+
+Final flow: recirc_id=0x2727f,eth,tcp,reg0=0x300,reg11=0x5,reg12=0x2,reg13=0xf,reg14=0x9,reg15=0x1,metadata=0x12,in_port=14,vlan_tci=0x0000,dl_src=0a:58:0a:81:02:09,dl_dst=0a:58:0a:81:02:01,nw_src=10.129.2.9,nw_dst=10.131.0.28,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=12345,tp_dst=8080,tcp_flags=0
+Megaflow: recirc_id=0x2727f,ct_state=+new-est-rel-rpl-inv+trk,ct_mark=0/0xf,eth,tcp,in_port=14,dl_src=0a:58:0a:81:02:09,dl_dst=0a:58:0a:81:02:01,nw_src=10.129.2.8/29,nw_dst=10.131.0.28,nw_ecn=0,nw_ttl=64,nw_frag=no
+Datapath actions: ct(commit,zone=15,mark=0/0x1,nat(src)),set(tunnel(tun_id=0xa,dst=10.74.211.238,ttl=64,tp_dst=6081,geneve({class=0x102,type=0x80,len=4,0xc000a}),flags(df|csum|key))),set(eth(src=0a:58:0a:83:00:01,dst=0a:58:0a:83:00:1c)),set(ipv4(ttl=63)),5
+
+[0m
+[32m[1movn-detrace source pod to destination pod indicates success from httpd-67d9dd4546-h2bp8 to httpd-67d9dd4546-sztcr[0m
+I0420 09:36:08.509119   22647 ovnkube-trace.go:615] ovn-detrace destination pod to source pod Output:
+[3mFlow: tcp,in_port=32,vlan_tci=0x0000,dl_src=0a:58:0a:83:00:1c,dl_dst=0a:58:0a:83:00:01,nw_src=10.131.0.28,nw_dst=10.129.2.9,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=12345,tp_dst=8080,tcp_flags=0
+
+bridge("br-int")
+----------------
+0. in_port=32, priority 100, cookie 0xa181cdae
+set_field:0x7->reg13
+set_field:0x6->reg11
+set_field:0x1->reg12
+set_field:0xc->metadata
+set_field:0x13->reg14
+resubmit(,8)
+  * Logical datapath: "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767)
+  * Port Binding: logical_port "ayush_httpd-67d9dd4546-sztcr", tunnel_key 19, chassis-name "9355cb41-9010-4704-b9b3-7b46f24cf93d", chassis-str "worker-1.aygarg.example.com"
+8. metadata=0xc, priority 50, cookie 0x5aba4ca0
+set_field:0/0x1000->reg10
+resubmit(,73)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=0 (ls_in_check_port_sec), priority=50, match=(1), actions=(reg0[15] = check_in_port_sec(); next;)
+73. ip,reg14=0x13,metadata=0xc,dl_src=0a:58:0a:83:00:1c,nw_src=10.131.0.28, priority 90, cookie 0xa181cdae
+set_field:0/0x1000->reg10
+move:NXM_NX_REG10[12]->NXM_NX_XXREG0[111]
+-> NXM_NX_XXREG0[111] is now 0
+resubmit(,9)
+  * Logical datapath: "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767)
+  * Port Binding: logical_port "ayush_httpd-67d9dd4546-sztcr", tunnel_key 19, chassis-name "9355cb41-9010-4704-b9b3-7b46f24cf93d", chassis-str "worker-1.aygarg.example.com"
+9. metadata=0xc, priority 0, cookie 0xf3e6ead9
+resubmit(,10)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=1 (ls_in_apply_port_sec), priority=0, match=(1), actions=(next;)
+10. metadata=0xc, priority 0, cookie 0xa811b2fe
+resubmit(,11)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=2 (ls_in_lookup_fdb), priority=0, match=(1), actions=(next;)
+11. metadata=0xc, priority 0, cookie 0x9e6ebe89
+resubmit(,12)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=3 (ls_in_put_fdb), priority=0, match=(1), actions=(next;)
+12. ip,metadata=0xc, priority 100, cookie 0x45bf886a
+set_field:0x1000000000000000000000000/0x1000000000000000000000000->xxreg0
+resubmit(,13)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  * Logical flow: table=4 (ls_in_pre_acl), priority=100, match=(ip), actions=(reg0[0] = 1; next;)
+13. ip,metadata=0xc, priority 100, cookie 0xf55a2d7
+set_field:0x4000000000000000000000000/0x4000000000000000000000000->xxreg0
+resubmit(,14)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  * Logical flow: table=5 (ls_in_pre_lb), priority=100, match=(ip), actions=(reg0[2] = 1; next;)
+14. ip,reg0=0x4/0x4,metadata=0xc, priority 110, cookie 0x22d08286
+ct(table=15,zone=NXM_NX_REG13[0..15],nat)
+nat
+-> A clone of the packet is forked to recirculate. The forked pipeline will be resumed at table 15.
+-> Sets the packet to an untracked state, and clears all the conntrack fields.
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=6 (ls_in_pre_stateful), priority=110, match=(reg0[2] == 1), actions=(ct_lb_mark;)
+
+Final flow: tcp,reg0=0x5,reg11=0x6,reg12=0x1,reg13=0x7,reg14=0x13,metadata=0xc,in_port=32,vlan_tci=0x0000,dl_src=0a:58:0a:83:00:1c,dl_dst=0a:58:0a:83:00:01,nw_src=10.131.0.28,nw_dst=10.129.2.9,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=12345,tp_dst=8080,tcp_flags=0
+Megaflow: recirc_id=0,eth,tcp,in_port=32,dl_src=0a:58:0a:83:00:1c,dl_dst=0a:58:0a:83:00:01,nw_src=10.131.0.28,nw_dst=0.0.0.0/1,nw_frag=no
+Datapath actions: ct(zone=7,nat),recirc(0x64cc0)
+
+===============================================================================
+recirc(0x64cc0) - resume conntrack with default ct_state=trk|new (use --ct-next to customize)
+Replacing src/dst IP/ports to simulate NAT:
+Initial flow:
+Modified flow:
+===============================================================================
+
+Flow: recirc_id=0x64cc0,ct_state=new|trk,ct_zone=7,eth,tcp,reg0=0x5,reg11=0x6,reg12=0x1,reg13=0x7,reg14=0x13,metadata=0xc,in_port=32,vlan_tci=0x0000,dl_src=0a:58:0a:83:00:1c,dl_dst=0a:58:0a:83:00:01,nw_src=10.131.0.28,nw_dst=10.129.2.9,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=12345,tp_dst=8080,tcp_flags=0
+
+bridge("br-int")
+----------------
+thaw
+Resuming from table 15
+15. ct_state=+new-est+trk,metadata=0xc, priority 7, cookie 0xd4f0dc90
+set_field:0x80000000000000000000000000/0x80000000000000000000000000->xxreg0
+set_field:0x200000000000000000000000000/0x200000000000000000000000000->xxreg0
+resubmit(,16)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  * Logical flow: table=7 (ls_in_acl_hint), priority=7, match=(ct.new && !ct.est), actions=(reg0[7] = 1; reg0[9] = 1; next;)
+16. ct_state=-est+trk,ip,metadata=0xc, priority 1, cookie 0x970f2255
+set_field:0x2000000000000000000000000/0x2000000000000000000000000->xxreg0
+resubmit(,17)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  * Logical flow: table=8 (ls_in_acl), priority=1, match=(ip && !ct.est), actions=(reg0[1] = 1; next;)
+17. metadata=0xc, priority 0, cookie 0xa7fd0bc7
+resubmit(,18)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=9 (ls_in_qos_mark), priority=0, match=(1), actions=(next;)
+18. metadata=0xc, priority 0, cookie 0x57c6a5b4
+resubmit(,19)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=10 (ls_in_qos_meter), priority=0, match=(1), actions=(next;)
+19. metadata=0xc, priority 0, cookie 0xc77d4848
+resubmit(,20)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=11 (ls_in_lb_aff_check), priority=0, match=(1), actions=(next;)
+20. metadata=0xc, priority 0, cookie 0xfa9b2748
+resubmit(,21)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=12 (ls_in_lb), priority=0, match=(1), actions=(next;)
+21. metadata=0xc, priority 0, cookie 0xf2e8c077
+resubmit(,22)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=13 (ls_in_lb_aff_learn), priority=0, match=(1), actions=(next;)
+22. ct_state=+trk,ip,metadata=0xc, priority 100, cookie 0x700253a5
+set_field:0/0x80->reg10
+resubmit(,68)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  * Logical flow: table=14 (ls_in_pre_hairpin), priority=100, match=(ip && ct.trk), actions=(reg0[6] = chk_lb_hairpin(); reg0[12] = chk_lb_hairpin_reply(); next;)
+68. No match.
+drop
+move:NXM_NX_REG10[7]->NXM_NX_XXREG0[102]
+-> NXM_NX_XXREG0[102] is now 0
+set_field:0/0x80->reg10
+resubmit(,69)
+69. No match.
+drop
+move:NXM_NX_REG10[7]->NXM_NX_XXREG0[108]
+-> NXM_NX_XXREG0[108] is now 0
+resubmit(,23)
+23. metadata=0xc, priority 0, cookie 0xe2d770f6
+resubmit(,24)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=15 (ls_in_nat_hairpin), priority=0, match=(1), actions=(next;)
+24. metadata=0xc, priority 0, cookie 0x2f74c955
+resubmit(,25)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=16 (ls_in_hairpin), priority=0, match=(1), actions=(next;)
+25. metadata=0xc, priority 0, cookie 0x78dc1d34
+resubmit(,26)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=17 (ls_in_acl_after_lb), priority=0, match=(1), actions=(next;)
+26. ip,reg0=0x2/0x2002,metadata=0xc, priority 100, cookie 0x462ab84b
+ct(commit,zone=NXM_NX_REG13[0..15],nat(src),exec(set_field:0/0x1->ct_mark))
+nat(src)
+set_field:0/0x1->ct_mark
+-> Sets the packet to an untracked state, and clears all the conntrack fields.
+resubmit(,27)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=18 (ls_in_stateful), priority=100, match=(reg0[1] == 1 && reg0[13] == 0), actions=(ct_commit { ct_mark.blocked = 0; }; next;)
+27. metadata=0xc, priority 0, cookie 0xa7060400
+resubmit(,28)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=19 (ls_in_arp_rsp), priority=0, match=(1), actions=(next;)
+28. metadata=0xc, priority 0, cookie 0x14253cff
+resubmit(,29)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=20 (ls_in_dhcp_options), priority=0, match=(1), actions=(next;)
+29. metadata=0xc, priority 0, cookie 0x162f2faa
+resubmit(,30)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=21 (ls_in_dhcp_response), priority=0, match=(1), actions=(next;)
+30. metadata=0xc, priority 0, cookie 0x2817620b
+resubmit(,31)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=22 (ls_in_dns_lookup), priority=0, match=(1), actions=(next;)
+31. metadata=0xc, priority 0, cookie 0x50fa26d2
+resubmit(,32)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=23 (ls_in_dns_response), priority=0, match=(1), actions=(next;)
+32. metadata=0xc, priority 0, cookie 0x57e03e44
+resubmit(,33)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [ingress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [ingress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [ingress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [ingress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [ingress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [ingress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [ingress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [ingress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [ingress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [ingress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [ingress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [ingress]
+  * Logical flow: table=24 (ls_in_external_port), priority=0, match=(1), actions=(next;)
+33. metadata=0xc,dl_dst=0a:58:0a:83:00:01, priority 50, cookie 0x2e1b5291
+set_field:0x1->reg15
+resubmit(,37)
+  * Logical datapaths:
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [ingress]
+  * Logical flow: table=25 (ls_in_l2_lkup), priority=50, match=(eth.dst == 0a:58:0a:83:00:01), actions=(outport = "stor-worker-1.aygarg.example.com"; output;)
+   * Logical Switch Port: stor-worker-1.aygarg.example.com type router (addresses ['router'], dynamic addresses [], security []
+37. priority 0
+resubmit(,38)
+38. reg15=0x1,metadata=0xc, priority 100, cookie 0x813f6473
+set_field:0x6->reg11
+set_field:0x1->reg12
+resubmit(,39)
+  * Logical datapath: "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767)
+  * Port Binding: logical_port "stor-worker-1.aygarg.example.com", tunnel_key 1, 
+39. priority 0
+set_field:0->reg0
+set_field:0->reg1
+set_field:0->reg2
+set_field:0->reg3
+set_field:0->reg4
+set_field:0->reg5
+set_field:0->reg6
+set_field:0->reg7
+set_field:0->reg8
+set_field:0->reg9
+resubmit(,40)
+40. ip,reg15=0x1,metadata=0xc, priority 110, cookie 0x834e6aa3
+resubmit(,41)
+  * Logical datapaths:
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  * Logical flow: table=0 (ls_out_pre_lb), priority=110, match=(ip && outport == "stor-worker-1.aygarg.example.com), actions=(next;)
+   * Logical Switch Port: stor-worker-1.aygarg.example.com type router (addresses ['router'], dynamic addresses [], security []
+41. ip,reg15=0x1,metadata=0xc, priority 110, cookie 0x9cc1b937
+resubmit(,42)
+  * Logical datapaths:
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  * Logical flow: table=1 (ls_out_pre_acl), priority=110, match=(ip && outport == "stor-worker-1.aygarg.example.com), actions=(next;)
+   * Logical Switch Port: stor-worker-1.aygarg.example.com type router (addresses ['router'], dynamic addresses [], security []
+42. metadata=0xc, priority 0, cookie 0xcf812695
+resubmit(,43)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [egress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [egress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [egress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [egress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [egress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [egress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [egress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [egress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [egress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [egress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [egress]
+  * Logical flow: table=2 (ls_out_pre_stateful), priority=0, match=(1), actions=(next;)
+43. ct_state=-trk,metadata=0xc, priority 5, cookie 0x7f1d2b2
+set_field:0x100000000000000000000000000/0x100000000000000000000000000->xxreg0
+set_field:0x200000000000000000000000000/0x200000000000000000000000000->xxreg0
+resubmit(,44)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [egress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [egress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [egress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [egress]
+  * Logical flow: table=3 (ls_out_acl_hint), priority=5, match=(!ct.trk), actions=(reg0[8] = 1; reg0[9] = 1; next;)
+44. metadata=0xc, priority 0, cookie 0xec17136c
+resubmit(,45)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [egress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [egress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [egress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [egress]
+  * Logical flow: table=4 (ls_out_acl), priority=0, match=(1), actions=(next;)
+45. metadata=0xc, priority 0, cookie 0xda476012
+resubmit(,46)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [egress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [egress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [egress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [egress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [egress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [egress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [egress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [egress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [egress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [egress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [egress]
+  * Logical flow: table=5 (ls_out_qos_mark), priority=0, match=(1), actions=(next;)
+46. metadata=0xc, priority 0, cookie 0x6c235daa
+resubmit(,47)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [egress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [egress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [egress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [egress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [egress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [egress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [egress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [egress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [egress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [egress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [egress]
+  * Logical flow: table=6 (ls_out_qos_meter), priority=0, match=(1), actions=(next;)
+47. metadata=0xc, priority 0, cookie 0xc9f354ab
+resubmit(,48)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [egress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [egress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [egress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [egress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [egress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [egress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [egress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [egress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [egress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [egress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [egress]
+  * Logical flow: table=7 (ls_out_stateful), priority=0, match=(1), actions=(next;)
+48. metadata=0xc, priority 0, cookie 0x4bb43fc3
+set_field:0/0x1000->reg10
+resubmit(,75)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [egress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [egress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [egress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [egress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [egress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [egress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [egress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [egress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [egress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [egress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [egress]
+  * Logical flow: table=8 (ls_out_check_port_sec), priority=0, match=(1), actions=(reg0[15] = check_out_port_sec(); next;)
+75. No match.
+drop
+move:NXM_NX_REG10[12]->NXM_NX_XXREG0[111]
+-> NXM_NX_XXREG0[111] is now 0
+resubmit(,49)
+49. metadata=0xc, priority 0, cookie 0x19eeb67a
+resubmit(,64)
+  * Logical datapaths:
+  *     "worker-0.aygarg.example.com" (2582645e-e5e6-4d93-ac16-811e2328346c) [egress]
+  *     "worker-2.aygarg.example.com" (29bb478b-d6fa-4c01-b478-eb7a53da8416) [egress]
+  *     "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767) [egress]
+  *     "master-0.aygarg.example.com" (3e708aaf-6ae3-40d1-8aac-909c206e847c) [egress]
+  *     "master-1.aygarg.example.com" (66dd1118-0fc4-4783-9df2-e6be6ed16ceb) [egress]
+  *     "ext_master-2.aygarg.example.com" (68cce4bd-9fe8-4840-93a4-0e08eb5e9790) [egress]
+  *     "ext_worker-2.aygarg.example.com" (693c04d2-53ee-4acd-b868-8b92d91dde64) [egress]
+  *     "ext_worker-1.aygarg.example.com" (86c56c2c-6918-4d20-b8e0-cc24d4922b69) [egress]
+  *     "ext_master-0.aygarg.example.com" (910e8912-be2b-451a-8f9d-23fbe58ea03b) [egress]
+  *     "join" (9b34bca0-cb14-4231-89fd-785761077e4b) [egress]
+  *     "ext_worker-0.aygarg.example.com" (9db03666-2390-476c-be89-28b8766c0be3) [egress]
+  *     "master-2.aygarg.example.com" (d2566219-0533-413d-a94a-1beb9d58a0ba) [egress]
+  *     "ext_master-1.aygarg.example.com" (d94df0d4-aa30-4545-89b6-5bb3562c5688) [egress]
+  * Logical flow: table=9 (ls_out_apply_port_sec), priority=0, match=(1), actions=(output;)
+64. priority 0
+resubmit(,65)
+65. reg15=0x1,metadata=0xc, priority 100, cookie 0x813f6473
+clone(ct_clear,set_field:0->reg11,set_field:0->reg12,set_field:0->reg13,set_field:0x8->reg11,set_field:0x4->reg12,set_field:0xa->metadata,set_field:0x8->reg14,set_field:0->reg10,set_field:0->reg15,set_field:0->reg0,set_field:0->reg1,set_field:0->reg2,set_field:0->reg3,set_field:0->reg4,set_field:0->reg5,set_field:0->reg6,set_field:0->reg7,set_field:0->reg8,set_field:0->reg9,resubmit(,8))
+ct_clear
+set_field:0->reg11
+set_field:0->reg12
+set_field:0->reg13
+set_field:0x8->reg11
+set_field:0x4->reg12
+set_field:0xa->metadata
+set_field:0x8->reg14
+set_field:0->reg10
+set_field:0->reg15
+set_field:0->reg0
+set_field:0->reg1
+set_field:0->reg2
+set_field:0->reg3
+set_field:0->reg4
+set_field:0->reg5
+set_field:0->reg6
+set_field:0->reg7
+set_field:0->reg8
+set_field:0->reg9
+resubmit(,8)
+  * Logical datapath: "worker-1.aygarg.example.com" (2b08c8a3-42e3-45a2-9ec2-20bcf8996767)
+  * Port Binding: logical_port "stor-worker-1.aygarg.example.com", tunnel_key 1, 
+8. reg14=0x8,metadata=0xa,dl_dst=0a:58:0a:83:00:01, priority 50, cookie 0xe57bbf7
+set_field:0xa580a8300010000000000000000/0xffffffffffff0000000000000000->xxreg0
+resubmit(,9)
+  * Logical datapaths:
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  * Logical flow: table=0 (lr_in_admission), priority=50, match=(eth.dst == 0a:58:0a:83:00:01 && inport == "rtos-worker-1.aygarg.example.com" && is_chassis_resident("cr-rtos-worker-1.aygarg.example.com")), actions=(xreg0[0..47] = 0a:58:0a:83:00:01; next;)
+   * Logical Router Port: rtos-worker-1.aygarg.example.com mac 0a:58:0a:83:00:01 networks ['10.131.0.1/23'] ipv6_ra_configs {}
+9. metadata=0xa, priority 0, cookie 0xa52f6fb4
+set_field:0x4/0x4->xreg4
+resubmit(,10)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=1 (lr_in_lookup_neighbor), priority=0, match=(1), actions=(reg9[2] = 1; next;)
+10. reg9=0x4/0x4,metadata=0xa, priority 100, cookie 0xb12e07d7
+resubmit(,11)
+  * Logical datapaths:
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  * Logical flow: table=2 (lr_in_learn_neighbor), priority=100, match=(reg9[2] == 1), actions=(next;)
+11. metadata=0xa, priority 0, cookie 0x88a1832c
+resubmit(,12)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=3 (lr_in_ip_input), priority=0, match=(1), actions=(next;)
+12. metadata=0xa, priority 0, cookie 0xac630afa
+resubmit(,13)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=4 (lr_in_unsnat), priority=0, match=(1), actions=(next;)
+13. metadata=0xa, priority 0, cookie 0xea546619
+resubmit(,14)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=5 (lr_in_defrag), priority=0, match=(1), actions=(next;)
+14. metadata=0xa, priority 0, cookie 0xaaace7f1
+resubmit(,15)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=6 (lr_in_lb_aff_check), priority=0, match=(1), actions=(next;)
+15. metadata=0xa, priority 0, cookie 0xce56baa
+resubmit(,16)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=7 (lr_in_dnat), priority=0, match=(1), actions=(next;)
+16. metadata=0xa, priority 0, cookie 0xbc84fcdc
+resubmit(,17)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=8 (lr_in_lb_aff_learn), priority=0, match=(1), actions=(next;)
+17. metadata=0xa, priority 0, cookie 0x1d51e88f
+resubmit(,18)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=9 (lr_in_ecmp_stateful), priority=0, match=(1), actions=(next;)
+18. metadata=0xa, priority 0, cookie 0xf475b505
+resubmit(,19)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=10 (lr_in_nd_ra_options), priority=0, match=(1), actions=(next;)
+19. metadata=0xa, priority 0, cookie 0xec55c35
+resubmit(,20)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=11 (lr_in_nd_ra_response), priority=0, match=(1), actions=(next;)
+20. metadata=0xa, priority 0, cookie 0xf0f9778b
+set_field:0/0xffffffff->xxreg1
+resubmit(,21)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=12 (lr_in_ip_routing_pre), priority=0, match=(1), actions=(reg7 = 0; next;)
+21. ip,metadata=0xa,nw_dst=10.129.2.0/23, priority 71, cookie 0x15cb4afd
+dec_ttl()
+set_field:0/0xffff00000000->xreg4
+move:NXM_OF_IP_DST[]->NXM_NX_XXREG0[96..127]
+-> NXM_NX_XXREG0[96..127] is now 0xa810209
+set_field:0xa8102010000000000000000/0xffffffff0000000000000000->xxreg0
+set_field:0a:58:0a:81:02:01->eth_src
+set_field:0xc->reg15
+set_field:0x1/0x1->reg10
+resubmit(,22)
+  * Logical datapaths:
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  * Logical flow: table=13 (lr_in_ip_routing), priority=71, match=(ip4.dst == 10.129.2.0/23), actions=(ip.ttl--; reg8[0..15] = 0; reg0 = ip4.dst; reg1 = 10.129.2.1; eth.src = 0a:58:0a:81:02:01; outport = "rtos-worker-2.aygarg.example.com"; flags.loopback = 1; next;)
+   * Logical Router Port: rtos-worker-2.aygarg.example.com mac 0a:58:0a:81:02:01 networks ['10.129.2.1/23'] ipv6_ra_configs {}
+22. reg8=0/0xffff,metadata=0xa, priority 150, cookie 0xa45c00c0
+resubmit(,23)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=14 (lr_in_ip_routing_ecmp), priority=150, match=(reg8[0..15] == 0), actions=(next;)
+23. ip,metadata=0xa,nw_src=10.128.0.0/14,nw_dst=10.128.0.0/14, priority 102, cookie 0x8a306a40
+set_field:0/0xffff00000000->xreg4
+resubmit(,24)
+  * Logical datapaths:
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  * Logical flow: table=15 (lr_in_policy), priority=102, match=(ip4.src == 10.128.0.0/14 && ip4.dst == 10.128.0.0/14), actions=(reg8[0..15] = 0; next;)
+   * Logical Router Policy: priority 102 match ip4.src == 10.128.0.0/14 && ip4.dst == 10.128.0.0/14 action allow nexthop []
+24. reg8=0/0xffff,metadata=0xa, priority 150, cookie 0x9cb3bb4f
+resubmit(,25)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=16 (lr_in_policy_ecmp), priority=150, match=(reg8[0..15] == 0), actions=(next;)
+25. reg0=0xa810209,reg15=0xc,metadata=0xa, priority 100, cookie 0x4712eeae
+set_field:0a:58:0a:81:02:09->eth_dst
+resubmit(,26)
+  * Logical datapaths:
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  * Logical flow: table=17 (lr_in_arp_resolve), priority=100, match=(outport == "rtos-worker-2.aygarg.example.com" && reg0 == 10.129.2.9), actions=(eth.dst = 0a:58:0a:81:02:09; next;)
+   * Logical Switch Port: test-label_httpd-67d9dd4546-h2bp8 type  (addresses ['0a:58:0a:81:02:09 10.129.2.9'], dynamic addresses [], security ['0a:58:0a:81:02:09 10.129.2.9']
+26. metadata=0xa, priority 0, cookie 0x84b7889f
+resubmit(,27)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=18 (lr_in_chk_pkt_len), priority=0, match=(1), actions=(next;)
+27. metadata=0xa, priority 0, cookie 0xdedfbdc2
+resubmit(,28)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=19 (lr_in_larger_pkts), priority=0, match=(1), actions=(next;)
+28. reg15=0xc,metadata=0xa, priority 50, cookie 0x2bfc9a1c
+set_field:0xd->reg15
+resubmit(,29)
+  * Logical datapaths:
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  * Logical flow: table=20 (lr_in_gw_redirect), priority=50, match=(outport == "rtos-worker-2.aygarg.example.com), actions=(outport = "cr-rtos-worker-2.aygarg.example.com"; next;)
+   * Logical Router Port: rtos-worker-2.aygarg.example.com mac 0a:58:0a:81:02:01 networks ['10.129.2.1/23'] ipv6_ra_configs {}
+29. metadata=0xa, priority 0, cookie 0xd7102543
+resubmit(,37)
+  * Logical datapaths:
+  *     "GR_worker-1.aygarg.example.com" (12b2d50f-d588-4472-b725-c1c0949c511e) [ingress]
+  *     "GR_worker-2.aygarg.example.com" (3efb383a-ec03-4fc4-9c77-f1320bd5a4d9) [ingress]
+  *     "GR_master-2.aygarg.example.com" (5f7d14d7-2955-4fa3-b7a5-e7c5523faba0) [ingress]
+  *     "GR_master-0.aygarg.example.com" (6dd6cef1-4a13-4475-9b50-d98fca7856e5) [ingress]
+  *     "GR_worker-0.aygarg.example.com" (73602d70-5535-43ab-924a-b1b468982ccb) [ingress]
+  *     "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73) [ingress]
+  *     "GR_master-1.aygarg.example.com" (97b07851-d6ea-4c27-8b72-b05ebb2ff4a2) [ingress]
+  * Logical flow: table=21 (lr_in_arp_request), priority=0, match=(1), actions=(output;)
+37. reg15=0xd,metadata=0xa, priority 100, cookie 0x768deda0
+set_field:0xa/0xffffff->tun_id
+set_field:0xd->tun_metadata0
+move:NXM_NX_REG14[0..14]->NXM_NX_TUN_METADATA0[16..30]
+-> NXM_NX_TUN_METADATA0[16..30] is now 0x8
+output:22
+-> output to kernel tunnel
+resubmit(,38)
+  * Logical datapath: "ovn_cluster_router" (8c1a36f9-702b-4fe6-ac85-902903261b73)
+  * Port Binding: logical_port "cr-rtos-worker-2.aygarg.example.com", tunnel_key 13, chassis-name "958aa269-1460-40c2-b81e-16525d79729e", chassis-str "worker-2.aygarg.example.com"
+38. priority 0
+drop
+
+Final flow: recirc_id=0x64cc0,eth,tcp,reg0=0x300,reg11=0x6,reg12=0x1,reg13=0x7,reg14=0x13,reg15=0x1,metadata=0xc,in_port=32,vlan_tci=0x0000,dl_src=0a:58:0a:83:00:1c,dl_dst=0a:58:0a:83:00:01,nw_src=10.131.0.28,nw_dst=10.129.2.9,nw_tos=0,nw_ecn=0,nw_ttl=64,nw_frag=no,tp_src=12345,tp_dst=8080,tcp_flags=0
+Megaflow: recirc_id=0x64cc0,ct_state=+new-est-rel-rpl-inv+trk,ct_mark=0/0xf,eth,tcp,in_port=32,dl_src=0a:58:0a:83:00:1c,dl_dst=0a:58:0a:83:00:01,nw_src=10.131.0.16/28,nw_dst=10.129.2.9,nw_ecn=0,nw_ttl=64,nw_frag=no
+Datapath actions: ct(commit,zone=7,mark=0/0x1,nat(src)),set(tunnel(tun_id=0xa,dst=10.74.210.74,ttl=64,tp_dst=6081,geneve({class=0x102,type=0x80,len=4,0x8000d}),flags(df|csum|key))),set(eth(src=0a:58:0a:81:02:01,dst=0a:58:0a:81:02:09)),set(ipv4(ttl=63)),4
+
+[0m
+[32m[1movn-detrace destination pod to source pod indicates success from httpd-67d9dd4546-sztcr to httpd-67d9dd4546-h2bp8[0m
+
+
+
+ovnkube-trace -dst-namespace test2 -dst httpd-7fc99d8bb4-97hvx -src-namespace test  -src httpd-bdbd96d6d-5qrb2 -tcp -dst-port 80 -loglevel 2
+
+
+
+
+
+oc cp -n openshift-ovn-kubernetes $POD:/usr/bin/ovnkube-trace ovnkube-trace
+
+
+
+
+
+
+
+
+
+sh-4.4# ovn-appctl -t /run/ovn/ovn-northd*.ctl status
+Status: active
+
+
+
+
+sh-4.4# ovn-appctl -t /run/ovn/ovnsb_db.ctl cluster/status OVN_Southbound
+ec6d
+Name: OVN_Southbound
+Cluster ID: 4e92 (4e9288b6-1162-45b6-9b34-eb7fc9b3e991)
+Server ID: ec6d (ec6d41df-c7bb-495a-8289-b61f7b6b9db6)
+Address: ssl:10.74.212.122:9644
+Status: cluster member
+Role: follower
+Term: 2
+Leader: 25cc
+Vote: unknown
+
+Election timer: 16000
+Log: [2, 2410]
+Entries not yet committed: 0
+Entries not yet applied: 0
+Connections: ->0000 ->efa2 <-25cc <-efa2
+Disconnections: 0
+Servers:
+    efa2 (efa2 at ssl:10.74.211.192:9644) last msg 9828272 ms ago
+    ec6d (ec6d at ssl:10.74.212.122:9644) (self)
+    25cc (25cc at ssl:10.74.214.90:9644) last msg 875 ms ago
+
+
+
+
+sh-4.4# ovn-appctl -t /run/ovn/ovnnb_db.ctl cluster/status OVN_Northbound
+a299
+Name: OVN_Northbound
+Cluster ID: 9947 (9947e7fc-177d-4e56-9c49-bd5c593c824d)
+Server ID: a299 (a2995a11-f98e-4bec-9149-6c1ace021e7d)
+Address: ssl:10.74.212.122:9643
+Status: cluster member
+Role: follower
+Term: 2
+Leader: 9c71
+Vote: unknown
+
+Election timer: 10000
+Log: [2, 2614]
+Entries not yet committed: 0
+Entries not yet applied: 0
+Connections: ->0000 <-9c71 <-6a0d ->6a0d
+Disconnections: 0
+Servers:
+    a299 (a299 at ssl:10.74.212.122:9643) (self)
+    6a0d (6a0d at ssl:10.74.211.192:9643) last msg 9893945 ms ago
+    9c71 (9c71 at ssl:10.74.214.90:9643) last msg 2992 ms ago
+
+
+
+
+
+sh-4.4# ovn-nbctl find acl | grep -i ayush_allow_0
+
+
+_uuid               : 648168fe-8d4b-481e-9dfe-399880be86a3
+action              : allow-related
+direction           : to-lport
+external_ids        : {Ingress_num="0", ipblock_cidr="false", l4Match=None, namespace=ayush, policy=allow, policy_type=Ingress}
+label               : 0
+log                 : false
+match               : "ip4.src == {$a11003600352308087752, $a4449682624240568089} && outport == @a14867883077327806347"
+meter               : acl-logging
+name                : ayush_allow_0
+options             : {}
+priority            : 1001
+severity            : []

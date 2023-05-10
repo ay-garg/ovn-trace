@@ -1,0 +1,397 @@
+ingress(dp="worker-2.aygarg.example.com", inport="test-label_httpd-67d9dd4546-h2bp8")
+-------------------------------------------------------------------------------------------------
+
+
+Logical Switch Datapaths
+     Ingress Table 0: Admission Control and Ingress Port Security check
+
+https://man7.org/linux/man-pages/man8/ovn-northd.8.html
+
+https://github.com/ovn-org/ovn/blob/0bee8ed1728eb2ef921a3bde900580a22a165268/northd/northd.c#L7927
+
+        ovn_lflow_add(lflows, od, S_SWITCH_IN_CHECK_PORT_SEC, 50, "1",
+                      REGBIT_PORT_SEC_DROP" = check_in_port_sec(); next;");
+
+ 0. ls_in_check_port_sec (northd.c:8410): 1, priority 50, uuid 5aba4ca0
+    reg0[15] = check_in_port_sec();
+    next;
+
+
+sh-4.4# ovn-nbctl lsp-get-port-security ayush_httpd-67d9dd4546-sztcr
+0a:58:0a:83:00:1c 10.131.0.28
+
+=========================
+
+     Ingress Table 4: from-lport Pre-ACLs
+
+       This table prepares flows for possible stateful ACL processing in
+       ingress table ACLs. It contains a priority-0 flow that simply
+       moves traffic to the next table. If stateful ACLs are used in the
+       logical datapath, a priority-100 flow is added that sets a hint
+       (with reg0[0] = 1; next;) for table Pre-stateful to send IP
+       packets to the connection tracker before eventually advancing to
+       ingress table ACLs.
+
+/* Ingress and Egress Pre-ACL Table (Priority 100).
+         *
+         * Regardless of whether the ACL is "from-lport" or "to-lport",
+         * we need rules in both the ingress and egress table, because
+         * the return traffic needs to be followed.
+         *
+         * 'REGBIT_CONNTRACK_DEFRAG' is set to let the pre-stateful table send
+         * it to conntrack for tracking and defragmentation. */
+
+https://github.com/ovn-org/ovn/blob/0bee8ed1728eb2ef921a3bde900580a22a165268/northd/northd.c#L5801
+
+        ovn_lflow_add(lflows, od, S_SWITCH_IN_PRE_ACL, 100, "ip",
+                      REGBIT_CONNTRACK_DEFRAG" = 1; next;");
+
+
+sh-4.4# ovn-nbctl find acl
+
+_uuid               : 145cd070-0972-4431-b779-743044bd17a1
+action              : allow-related
+direction           : to-lport
+external_ids        : {}
+label               : 0
+log                 : false
+match               : "ip4.src==10.128.0.2"
+meter               : acl-logging
+name                : []
+options             : {}
+priority            : 1001
+severity            : []
+
+
+_uuid               : 08ed6e8c-40b4-42f9-bcdd-246052d7bb89
+action              : allow-related
+direction           : to-lport
+external_ids        : {}
+label               : 0
+log                 : false
+match               : "ip4.src==10.128.2.2"
+meter               : acl-logging
+name                : []
+options             : {}
+priority            : 1001
+severity            : []
+
+_uuid               : adc0ff15-2930-4d86-8814-8b70772afea9
+action              : allow-related
+direction           : to-lport
+external_ids        : {}
+label               : 0
+log                 : false
+match               : "ip4.src==10.131.0.2"
+meter               : acl-logging
+name                : []
+options             : {}
+priority            : 1001
+severity            : []
+
+_uuid               : 7ecf851d-82e9-4fc2-b773-60202e180058
+action              : allow-related
+direction           : to-lport
+external_ids        : {}
+label               : 0
+log                 : false
+match               : "ip4.src==10.129.0.2"
+meter               : acl-logging
+name                : []
+options             : {}
+priority            : 1001
+severity            : []
+
+_uuid               : 6581b665-fc70-4f32-86a7-b4d9e971e0d3
+action              : allow-related
+direction           : to-lport
+external_ids        : {}
+label               : 0
+log                 : false
+match               : "ip4.src==10.129.2.2"
+meter               : acl-logging
+name                : []
+options             : {}
+priority            : 1001
+severity            : []
+
+
+_uuid               : 23a2652e-3f3a-4072-893e-51323915ed4e
+action              : allow-related
+direction           : to-lport
+external_ids        : {}
+label               : 0
+log                 : false
+match               : "ip4.src==10.130.0.2"
+meter               : acl-logging
+name                : []
+options             : {}
+priority            : 1001
+severity            : []
+
+
+ 4. ls_in_pre_acl (northd.c:5868): ip, priority 100, uuid 45bf886a
+    reg0[0] = 1;
+    next;
+
+
+
+
+===============================
+
+https://man7.org/linux/man-pages/man8/ovn-northd.8.html
+
+
+     Ingress Table 5: Pre-LB
+
+
+If load balancing rules with virtual IP addresses (and
+       ports) are configured in OVN_Northbound database for a logical
+       switch datapath, a priority-100 flow is added with the match ip
+       to match on IP packets and sets the action reg0[2] = 1; next; to
+       act as a hint for table Pre-stateful to send IP packets to the
+       connection tracker for packet de-fragmentation (and to possibly
+       do DNAT for already established load balanced traffic) before
+       eventually advancing to ingress table Stateful
+
+https://github.com/ovn-org/ovn/blob/0bee8ed1728eb2ef921a3bde900580a22a165268/northd/northd.c#L5970
+
+    if (od->has_lb_vip) {
+        ovn_lflow_add(lflows, od, S_SWITCH_IN_PRE_LB,
+                      100, "ip", REGBIT_CONNTRACK_NAT" = 1; next;");
+        ovn_lflow_add(lflows, od, S_SWITCH_OUT_PRE_LB,
+                      100, "ip", REGBIT_CONNTRACK_NAT" = 1; next;");
+    }
+}
+
+ 5. ls_in_pre_lb (northd.c:6038): ip, priority 100, uuid 0f55a2d7
+    reg0[2] = 1;
+    next;
+
+
+===============================
+
+https://man7.org/linux/man-pages/man8/ovn-northd.8.html
+
+     Ingress Table 6: Pre-stateful
+
+ This table prepares flows for all possible stateful processing in
+       next tables. It contains a priority-0 flow that simply moves
+       traffic to the next table.
+
+   A priority-110 flow sends the packets that don’t
+                     match the above flows to connection tracker based
+                     on a hint provided by the previous tables (with a
+                     match for reg0[2] == 1) by using the ct_lb_mark;
+                     action.
+
+https://github.com/ovn-org/ovn/blob/0bee8ed1728eb2ef921a3bde900580a22a165268/northd/northd.c#L5994
+
+    ovn_lflow_add(lflows, od, S_SWITCH_IN_PRE_STATEFUL, 110,
+                  REGBIT_CONNTRACK_NAT" == 1", ct_lb_action);
+
+    ovn_lflow_add(lflows, od, S_SWITCH_OUT_PRE_STATEFUL, 110,
+                  REGBIT_CONNTRACK_NAT" == 1", ct_lb_action);
+
+ 6. ls_in_pre_stateful (northd.c:6061): reg0[2] == 1, priority 110, uuid 22d08286
+    ct_lb_mark;
+
+
+
+
+
+==================================================================================================================
+
+
+ct_lb_mark /* default (use --ct to customize) */
+------------------------------------------------
+
+Ingress Table 7: from-lport ACL hints
+
+       This table consists of logical flows that set hints (reg0 bits)
+       to be used in the next stage, in the ACL processing table, if
+       stateful ACLs or load balancers are configured. Multiple hints
+       can be set for the same packet. The possible hints are:
+
+    reg0[8]: the packet might match an allow-related
+                     ACL but there will be no need to commit the
+                     connection to conntrack because it already exists.
+
+reg0[10]: the packet might match a drop/reject ACL
+                     but the connection was previously allowed so it
+                     might have to be committed again with ct_label=1/1.
+
+https://github.com/ovn-org/ovn/blob/0bee8ed1728eb2ef921a3bde900580a22a165268/northd/northd.c#L6087
+
+        /* Already established connections in the "request" direction may hit
+         * either:
+         * - allow ACLs in which case the traffic should be allowed so we set
+         *   REGBIT_ACL_HINT_ALLOW.
+         * - drop ACLs in which case the traffic should be blocked and the
+         *   connection must be committed with ct_mark.blocked set so we set
+         *   REGBIT_ACL_HINT_BLOCK.
+         */
+        match = features->ct_no_masked_label
+                ? "!ct.new && ct.est && !ct.rpl && ct_mark.blocked == 0"
+                : "!ct.new && ct.est && !ct.rpl && ct_label.blocked == 0";
+        ovn_lflow_add(lflows, od, stage, 4, match,
+                      REGBIT_ACL_HINT_ALLOW " = 1; "
+                      REGBIT_ACL_HINT_BLOCK " = 1; "
+                      "next;");
+
+ 7. ls_in_acl_hint (northd.c:6159): !ct.new && ct.est && !ct.rpl && ct_mark.blocked == 0, priority 4, uuid ee05988c
+    reg0[8] = 1;
+    reg0[10] = 1;
+    next;
+
+===============================
+
+     Ingress Table 16: Pre-Hairpin
+
+              •      If the logical switch has load balancer(s)
+                     configured, then a priority-100 flow is added with
+                     the match ip && ct.trk to check if the packet needs
+                     to be hairpinned (if after load balancing the
+                     destination IP matches the source IP) or not by
+                     executing the actions reg0[6] = chk_lb_hairpin();
+                     and reg0[12] = chk_lb_hairpin_reply(); and advances
+                     the packet to the next table.
+
+https://github.com/ovn-org/ovn/blob/0bee8ed1728eb2ef921a3bde900580a22a165268/northd/northd.c#L7127
+
+        /* Check if the packet needs to be hairpinned.
+         * Set REGBIT_HAIRPIN in the original direction and
+         * REGBIT_HAIRPIN_REPLY in the reply direction.
+         */
+        ovn_lflow_add_with_hint(
+            lflows, od, S_SWITCH_IN_PRE_HAIRPIN, 100, "ip && ct.trk",
+            REGBIT_HAIRPIN " = chk_lb_hairpin(); "
+            REGBIT_HAIRPIN_REPLY " = chk_lb_hairpin_reply(); "
+            "next;",
+            &od->nbs->header_);
+
+14. ls_in_pre_hairpin (northd.c:7616): ip && ct.trk, priority 100, uuid 700253a5
+    reg0[6] = chk_lb_hairpin();
+    reg0[12] = chk_lb_hairpin_reply();
+    next;
+
+
+
+===============================
+
+Ingress Table 25 Destination Lookup
+
+       This table implements switching behavior. It contains these
+       logical flows:
+
+One priority-50 flow that matches each known
+                     Ethernet address against eth.dst. Action of this
+                     flow outputs the packet to the single associated
+                     output port if it is enabled. drop; action is
+                     applied if LSP is disabled.
+
+                     For the Ethernet address on a logical switch port
+                     of type router, when that logical switch port’s
+                     addresses column is set to router and the connected
+                     logical router port has a gateway chassis:
+
+                     •      The flow for the connected logical router
+                            port’s Ethernet address is only programmed
+                            on the gateway chassis.
+
+                     •      If the logical router has rules specified in
+                            nat with external_mac, then those addresses
+                            are also used to populate the switch’s
+                            destination lookup on the chassis where
+                            logical_port is resident.
+
+                     For the Ethernet address on a logical switch port
+                     of type router, when that logical switch port’s
+                     addresses column is set to router and the connected
+                     logical router port specifies a
+                     reside-on-redirect-chassis and the logical router
+                     to which the connected logical router port belongs
+                     to has a distributed gateway LRP:
+
+                     •      The flow for the connected logical router
+                            port’s Ethernet address is only programmed
+                            on the gateway chassis.
+
+                     For each forwarding group configured on the logical
+                     switch datapath, a priority-50 flow that matches on
+                     eth.dst == VIP
+                      with an action of fwd_group(childports=args ),
+                     where args contains comma separated logical switch
+                     child ports to load balance to. If liveness is
+                     enabled, then action also includes  liveness=true.
+
+25. ls_in_l2_lkup (northd.c:9147): eth.dst == 0a:58:0a:81:02:01, priority 50, uuid 025b9058
+    outport = "stor-worker-2.aygarg.example.com";
+    output;
+
+
+==================================================================================================================
+
+egress(dp="worker-2.aygarg.example.com", inport="test-label_httpd-67d9dd4546-h2bp8", outport="stor-worker-2.aygarg.example.com")
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+Egress Table 1: Pre-LB
+
+       This table is similar to ingress table Pre-LB. It contains a
+       priority-0 flow that simply moves traffic to the next table.
+
+       This table also has a priority-110 flow with the match eth.src ==
+       E for all logical switch datapaths to move traffic to the next
+       table. Where E is the service monitor mac defined in the
+       options:svc_monitor_mac column of NB_Global table.
+
+ 0. ls_out_pre_lb (northd.c:5758): ip && outport == "stor-worker-2.aygarg.example.com", priority 110, uuid e5ba8c50
+    next;
+ 
+ 
+===============================
+
+    /* If there are any stateful ACL rules in this datapath, we may
+     * send IP packets for some (allow) filters through the conntrack action,
+     * which handles defragmentation, in order to match L4 headers. */
+    if (od->has_stateful_acl) {
+        for (size_t i = 0; i < od->n_router_ports; i++) {
+            skip_port_from_conntrack(od, od->router_ports[i],
+                                     S_SWITCH_IN_PRE_ACL, S_SWITCH_OUT_PRE_ACL,
+                                     110, lflows);
+        }
+        for (size_t i = 0; i < od->n_localnet_ports; i++) {
+            skip_port_from_conntrack(od, od->localnet_ports[i],
+                                     S_SWITCH_IN_PRE_ACL, S_SWITCH_OUT_PRE_ACL,
+                                     110, lflows);
+        }
+
+ 1. ls_out_pre_acl (northd.c:5758): ip && outport == "stor-worker-2.aygarg.example.com", priority 110, uuid b6375457
+    next;
+ 
+
+
+===============================
+
+
+  Egress Table 3: from-lport ACL hints
+
+       This is similar to ingress table ACL hints.
+
+
+ 
+ 3. ls_out_acl_hint (northd.c:6159): !ct.new && ct.est && !ct.rpl && ct_mark.blocked == 0, priority 4, uuid 79c5913c
+    reg0[8] = 1;
+    reg0[10] = 1;
+    next;
+ 
+ 
+ 8. ls_out_check_port_sec (northd.c:5724): 1, priority 0, uuid 4bb43fc3
+    reg0[15] = check_out_port_sec();
+    next;
+ 
+ 
+ 9. ls_out_apply_port_sec (northd.c:5729): 1, priority 0, uuid 19eeb67a
+    output;
+    /* output to "stor-worker-2.aygarg.example.com", type "patch" */
